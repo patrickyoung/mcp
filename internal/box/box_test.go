@@ -41,7 +41,8 @@ func TestMakeGrantsNothingUntilAdmit(t *testing.T) {
 	if err := List(&listing, target, "tools"); err != nil {
 		t.Fatal(err)
 	}
-	fields := strings.Split(strings.TrimSpace(listing.String()), "\t")
+	firstLine := strings.Split(strings.TrimSpace(listing.String()), "\n")[0]
+	fields := strings.Split(firstLine, "\t")
 	if len(fields) != 3 || fields[0] != "echo" || len(fields[1]) != 64 {
 		t.Fatalf("listing = %q", listing.String())
 	}
@@ -72,6 +73,12 @@ func TestMakeGrantsNothingUntilAdmit(t *testing.T) {
 	}
 	if _, err := os.Stat(tool); !os.IsNotExist(err) {
 		t.Fatalf("revoked tool remains: %v", err)
+	}
+	if err := Admit(target, "tools", []string{"remote-schema"}, Config{MCP: fake}); err == nil {
+		t.Fatal("external schema reference was admitted")
+	}
+	if _, err := os.Stat(filepath.Join(target, "tools", "remote-schema")); !os.IsNotExist(err) {
+		t.Fatalf("refused external schema tool became callable: %v", err)
 	}
 
 	if err := Admit(target, "prompts", []string{"review"}, Config{MCP: fake}); err != nil {
@@ -124,7 +131,7 @@ case "$1" in
   request)
     ` + failure + `
     case "$2" in
-      tools/list) printf '%s\n' '{"resultType":"complete","tools":[{"name":"echo","description":"echo exact JSON","inputSchema":{"type":"object"}}]}' ;;
+      tools/list) printf '%s\n' '{"resultType":"complete","tools":[{"name":"echo","description":"echo exact JSON","inputSchema":{"type":"object"}},{"name":"remote-schema","description":"unsafe remote schema","inputSchema":{"$ref":"https://example.invalid/schema.json"}}]}' ;;
       prompts/list) printf '%s\n' '{"resultType":"complete","prompts":[{"name":"review","description":"review a change","arguments":[{"name":"tone"}]}]}' ;;
       resources/list) printf '%s\n' '{"resultType":"complete","resources":[{"uri":"doc://guide","name":"guide","description":"the guide"}]}' ;;
       resources/templates/list) printf '%s\n' '{"resultType":"complete","resourceTemplates":[]}' ;;

@@ -190,6 +190,11 @@ func Admit(dir, kind string, names []string, cfg Config) error {
 		if (spec.kind == "tools" || spec.kind == "prompts") && !safeName.MatchString(name) {
 			return fmt.Errorf("%s name %q is not a safe program name", spec.kind, name)
 		}
+		if spec.kind == "tools" {
+			if ref, ok := externalSchemaRef(entry.raw); ok {
+				return fmt.Errorf("tool %q contains unadmitted external schema reference %q", name, ref)
+			}
+		}
 		admissions[name] = digest
 	}
 	if err := writeAdmissionsAtomic(filepath.Join(dir, "admit", spec.kind+".tsv"), admissions); err != nil {
@@ -667,6 +672,42 @@ func oneLine(value string) string {
 		line = strings.TrimSpace(line[:117]) + "..."
 	}
 	return line
+}
+
+func externalSchemaRef(raw []byte) (string, bool) {
+	var descriptor map[string]any
+	if json.Unmarshal(raw, &descriptor) != nil {
+		return "", false
+	}
+	for _, field := range []string{"inputSchema", "outputSchema"} {
+		if ref, ok := findExternalRef(descriptor[field]); ok {
+			return ref, true
+		}
+	}
+	return "", false
+}
+
+func findExternalRef(value any) (string, bool) {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if key == "$ref" || key == "$dynamicRef" {
+				if ref, ok := child.(string); ok && !strings.HasPrefix(ref, "#") {
+					return ref, true
+				}
+			}
+			if ref, ok := findExternalRef(child); ok {
+				return ref, true
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if ref, ok := findExternalRef(child); ok {
+				return ref, true
+			}
+		}
+	}
+	return "", false
 }
 
 func replaceEnv(environ []string, key, value string) []string {
