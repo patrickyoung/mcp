@@ -2,6 +2,7 @@ package mcpclient
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -141,6 +142,17 @@ func TestExplicitContinuationAndTaskExtension(t *testing.T) {
 	task, err := Request(context.Background(), helperEndpoint(t, "ok"), "io.modelcontextprotocol/tasks/get", json.RawMessage(`{"taskId":"t-1"}`), Options{})
 	if err != nil || task.Code != 75 || !strings.Contains(string(task.Raw), `"status":"working"`) {
 		t.Fatalf("task = %#v, %v", task, err)
+	}
+}
+
+func TestListenEmitsJSONLAndDoesNotReconnect(t *testing.T) {
+	var stream bytes.Buffer
+	err := Listen(context.Background(), helperEndpoint(t, "listen"), Options{Timeout: 100 * time.Millisecond, Listen: &stream})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Listen error = %v", err)
+	}
+	if got := stream.String(); !strings.Contains(got, `"method":"notifications/tools/list_changed"`) {
+		t.Fatalf("stream = %q", got)
 	}
 }
 
@@ -325,6 +337,9 @@ func serveHelper(mode string, extra []string) {
 			}
 		case "io.modelcontextprotocol/tasks/get":
 			writeResponse(enc, req.ID, map[string]any{"taskId": "t-1", "status": "working"})
+		case "subscriptions/listen":
+			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged", "params": map[string]any{}})
+			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/tools/list_changed", "params": map[string]any{}})
 		default:
 			writeError(enc, req.ID, -32601, "method not found")
 		}
