@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,7 +16,7 @@ import (
 	"github.com/patrickyoung/mcp/internal/mcpclient"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -48,7 +49,11 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 		if err != nil {
 			return diagnose(stderr, err)
 		}
-		outcome, err := mcpclient.Discover(ctx, endpoint, cfg.options(stderr))
+		opts, err := cfg.options(stderr)
+		if err != nil {
+			return diagnose(stderr, err)
+		}
+		outcome, err := mcpclient.Discover(ctx, endpoint, opts)
 		return emit(stdout, stderr, outcome, err)
 	case "request":
 		cfg, rest, err := parseCommon("request", argv[1:], stderr)
@@ -71,7 +76,11 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 		if err != nil {
 			return diagnose(stderr, err)
 		}
-		outcome, err := mcpclient.Request(ctx, endpoint, method, params, cfg.options(stderr))
+		opts, err := cfg.options(stderr)
+		if err != nil {
+			return diagnose(stderr, err)
+		}
+		outcome, err := mcpclient.Request(ctx, endpoint, method, params, opts)
 		return emit(stdout, stderr, outcome, err)
 	case "tool":
 		return runTool(ctx, argv[1:], stdin, stdout, stderr)
@@ -79,6 +88,8 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 		return runPrompt(ctx, argv[1:], stdin, stdout, stderr)
 	case "read":
 		return runRead(ctx, argv[1:], stdout, stderr)
+	case "template-read":
+		return runTemplateRead(ctx, argv[1:], stdout, stderr)
 	case "listen":
 		cfg, rest, err := parseCommon("listen", argv[1:], stderr)
 		if err != nil {
@@ -92,7 +103,15 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 		if err != nil {
 			return diagnose(stderr, err)
 		}
-		opts := cfg.options(stderr)
+		opts, err := cfg.options(stderr)
+		if err != nil {
+			return diagnose(stderr, err)
+		}
+		subscriptions, err := mcpclient.ReadParams(stdin, cfg.maxInput)
+		if err != nil {
+			return diagnose(stderr, err)
+		}
+		opts.Subscriptions = subscriptions
 		opts.Listen = stdout
 		if err := mcpclient.Listen(ctx, endpoint, opts); err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -108,6 +127,40 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 	}
 }
 
+func runTemplateRead(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("template-read", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var cfg commonConfig
+	fs.DurationVar(&cfg.timeout, "timeout", 0, "request timeout (zero means none)")
+	fs.Int64Var(&cfg.maxOutput, "max-output", mcpclient.DefaultMaxWire, "maximum server bytes")
+	fs.IntVar(&cfg.eventFD, "event-fd", -1, "descriptor for progress JSONL")
+	fs.IntVar(&cfg.headerFD, "header-fd", -1, "descriptor containing HTTP headers")
+	fs.StringVar(&cfg.capabilitiesFile, "capabilities", "", "additional client capabilities JSON file")
+	fs.StringVar(&cfg.routeName, "route-name", "", "MCP routing name for extension requests")
+	expect := fs.String("expect", "", "reviewed descriptor digest")
+	if err := fs.Parse(argv); err != nil {
+		return 2
+	}
+	rest := fs.Args()
+	if len(rest) < 2 || *expect == "" {
+		return diagnose(stderr, fmt.Errorf("template-read: -expect DIGEST, TEMPLATE, and URI are required"))
+	}
+	server, err := afterSeparator(rest[2:])
+	if err != nil {
+		return diagnose(stderr, err)
+	}
+	endpoint, err := mcpclient.ResolveEndpoint(server)
+	if err != nil {
+		return diagnose(stderr, err)
+	}
+	opts, err := cfg.options(stderr)
+	if err != nil {
+		return diagnose(stderr, err)
+	}
+	outcome, err := mcpclient.ReadTemplateResource(ctx, endpoint, rest[0], rest[1], *expect, opts)
+	return emit(stdout, stderr, outcome, err)
+}
+
 func runPrompt(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	cfg, expect, name, server, err := parseAdmitted("prompt", argv, stderr)
 	if err != nil {
@@ -121,7 +174,11 @@ func runPrompt(ctx context.Context, argv []string, stdin io.Reader, stdout, stde
 	if err != nil {
 		return diagnose(stderr, err)
 	}
-	outcome, err := mcpclient.Prompt(ctx, endpoint, name, expect, params, cfg.options(stderr))
+	opts, err := cfg.options(stderr)
+	if err != nil {
+		return diagnose(stderr, err)
+	}
+	outcome, err := mcpclient.Prompt(ctx, endpoint, name, expect, params, opts)
 	return emit(stdout, stderr, outcome, err)
 }
 
@@ -134,7 +191,11 @@ func runRead(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return diagnose(stderr, err)
 	}
-	outcome, err := mcpclient.ReadResource(ctx, endpoint, uri, expect, cfg.options(stderr))
+	opts, err := cfg.options(stderr)
+	if err != nil {
+		return diagnose(stderr, err)
+	}
+	outcome, err := mcpclient.ReadResource(ctx, endpoint, uri, expect, opts)
 	return emit(stdout, stderr, outcome, err)
 }
 
@@ -146,6 +207,8 @@ func parseAdmitted(command string, argv []string, stderr io.Writer) (commonConfi
 	fs.Int64Var(&cfg.maxInput, "max-input", mcpclient.DefaultMaxInput, "maximum stdin bytes")
 	fs.Int64Var(&cfg.maxOutput, "max-output", mcpclient.DefaultMaxWire, "maximum server bytes")
 	fs.IntVar(&cfg.eventFD, "event-fd", -1, "descriptor for progress JSONL")
+	fs.IntVar(&cfg.headerFD, "header-fd", -1, "descriptor containing HTTP headers")
+	fs.StringVar(&cfg.capabilitiesFile, "capabilities", "", "additional client capabilities JSON file")
 	expect := fs.String("expect", "", "reviewed descriptor digest")
 	if err := fs.Parse(argv); err != nil {
 		return cfg, "", "", nil, err
@@ -168,6 +231,9 @@ func runTool(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr
 	maxInput := fs.Int64("max-input", mcpclient.DefaultMaxInput, "maximum stdin bytes")
 	maxOutput := fs.Int64("max-output", mcpclient.DefaultMaxWire, "maximum server bytes")
 	eventFD := fs.Int("event-fd", -1, "descriptor for progress JSONL")
+	headerFD := fs.Int("header-fd", -1, "descriptor containing HTTP headers")
+	capabilitiesFile := fs.String("capabilities", "", "additional client capabilities JSON file")
+	routeName := fs.String("route-name", "", "MCP routing name for extension requests")
 	expect := fs.String("expect", "", "reviewed descriptor digest")
 	if err := fs.Parse(argv); err != nil {
 		return 2
@@ -189,16 +255,23 @@ func runTool(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr
 	if err != nil {
 		return diagnose(stderr, err)
 	}
-	cfg := commonConfig{timeout: *timeout, maxInput: *maxInput, maxOutput: *maxOutput, eventFD: *eventFD}
-	outcome, err := mcpclient.Tool(ctx, endpoint, name, *expect, params, cfg.options(stderr))
+	cfg := commonConfig{timeout: *timeout, maxInput: *maxInput, maxOutput: *maxOutput, eventFD: *eventFD, headerFD: *headerFD, capabilitiesFile: *capabilitiesFile, routeName: *routeName}
+	opts, err := cfg.options(stderr)
+	if err != nil {
+		return diagnose(stderr, err)
+	}
+	outcome, err := mcpclient.Tool(ctx, endpoint, name, *expect, params, opts)
 	return emit(stdout, stderr, outcome, err)
 }
 
 type commonConfig struct {
-	timeout   time.Duration
-	maxInput  int64
-	maxOutput int64
-	eventFD   int
+	timeout          time.Duration
+	maxInput         int64
+	maxOutput        int64
+	eventFD          int
+	headerFD         int
+	capabilitiesFile string
+	routeName        string
 }
 
 func parseCommon(name string, argv []string, stderr io.Writer) (commonConfig, []string, error) {
@@ -209,6 +282,9 @@ func parseCommon(name string, argv []string, stderr io.Writer) (commonConfig, []
 	fs.Int64Var(&cfg.maxInput, "max-input", mcpclient.DefaultMaxInput, "maximum stdin bytes")
 	fs.Int64Var(&cfg.maxOutput, "max-output", mcpclient.DefaultMaxWire, "maximum server bytes")
 	fs.IntVar(&cfg.eventFD, "event-fd", -1, "descriptor for progress JSONL")
+	fs.IntVar(&cfg.headerFD, "header-fd", -1, "descriptor containing HTTP headers")
+	fs.StringVar(&cfg.capabilitiesFile, "capabilities", "", "additional client capabilities JSON file")
+	fs.StringVar(&cfg.routeName, "route-name", "", "MCP routing name for extension requests")
 	if err := fs.Parse(argv); err != nil {
 		return commonConfig{}, nil, err
 	}
@@ -218,15 +294,36 @@ func parseCommon(name string, argv []string, stderr io.Writer) (commonConfig, []
 	if cfg.eventFD >= 0 && cfg.eventFD < 3 {
 		return commonConfig{}, nil, fmt.Errorf("event descriptor must be 3 or greater")
 	}
+	if cfg.headerFD >= 0 && cfg.headerFD < 3 {
+		return commonConfig{}, nil, fmt.Errorf("header descriptor must be 3 or greater")
+	}
 	return cfg, fs.Args(), nil
 }
 
-func (c commonConfig) options(stderr io.Writer) mcpclient.Options {
+func (c commonConfig) options(stderr io.Writer) (mcpclient.Options, error) {
 	opts := mcpclient.Options{Timeout: c.timeout, MaxInput: c.maxInput, MaxOutput: c.maxOutput, Stderr: stderr}
+	opts.RouteName = c.routeName
 	if c.eventFD >= 3 {
 		opts.Events = os.NewFile(uintptr(c.eventFD), "mcp-events-fd-"+strconv.Itoa(c.eventFD))
 	}
-	return opts
+	if c.headerFD >= 3 {
+		f := os.NewFile(uintptr(c.headerFD), "mcp-headers-fd-"+strconv.Itoa(c.headerFD))
+		headers, err := mcpclient.ReadHeaders(f, 1<<20)
+		if err != nil {
+			return opts, err
+		}
+		opts.Headers = headers
+	}
+	if c.capabilitiesFile != "" {
+		raw, err := os.ReadFile(c.capabilitiesFile)
+		if err != nil {
+			return opts, fmt.Errorf("reading client capabilities: %w", err)
+		}
+		if err := json.Unmarshal(raw, &opts.Capabilities); err != nil {
+			return opts, fmt.Errorf("client capabilities must be one JSON object: %w", err)
+		}
+	}
+	return opts, nil
 }
 
 func afterSeparator(args []string) ([]string, error) {
@@ -281,6 +378,7 @@ func usage(w io.Writer) {
   mcp tool -expect DIGEST NAME -- SERVER [ARG ...]
   mcp prompt -expect DIGEST NAME -- SERVER [ARG ...]
   mcp read -expect DIGEST URI -- SERVER [ARG ...]
+  mcp template-read -expect DIGEST TEMPLATE URI -- SERVER [ARG ...]
   mcp listen [-timeout D] -- SERVER [ARG ...]
 
 stdin is empty or one JSON object. stdout is the exact MCP result. Server

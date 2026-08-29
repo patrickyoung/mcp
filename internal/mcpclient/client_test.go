@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,6 +71,97 @@ func TestOutputLimitAfterSendIsUnknown(t *testing.T) {
 	}
 }
 
+func TestStreamableHTTPPreservesFilterContractAndRoutingHeaders(t *testing.T) {
+	var calls []http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Header.Clone())
+		var req struct {
+			ID     any             `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		switch req.Method {
+		case "server/discover":
+			writeResponse(enc, req.ID, map[string]any{
+				"resultType": "complete", "supportedVersions": []string{ProtocolVersion},
+				"capabilities": map[string]any{"tools": map[string]any{}, "extensions": map[string]any{"io.modelcontextprotocol/tasks": map[string]any{}}},
+				"_meta":        map[string]any{"io.modelcontextprotocol/serverInfo": map[string]any{"name": "http-test", "version": "1"}},
+			})
+		case "tools/call":
+			writeResponse(enc, req.ID, map[string]any{"content": []any{}, "unknown": map[string]any{"kept": true}})
+		case "tasks/get":
+			writeResponse(enc, req.ID, map[string]any{"resultType": "complete", "taskId": "task-7", "status": "working"})
+		default:
+			writeError(enc, req.ID, -32601, "method not found")
+		}
+	}))
+	defer server.Close()
+
+	endpoint, err := ResolveEndpoint([]string{server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{Headers: http.Header{"Authorization": []string{"Bearer from-fd"}}}
+	out, err := Request(context.Background(), endpoint, "tools/call", json.RawMessage(`{"name":"echo","arguments":{}}`), opts)
+	if err != nil || out.Code != 0 || !strings.Contains(string(out.Raw), `"unknown":{"kept":true}`) {
+		t.Fatalf("HTTP request = %#v, %v", out, err)
+	}
+	task, err := Request(context.Background(), endpoint, "tasks/get", json.RawMessage(`{"taskId":"task-7"}`), opts)
+	if err != nil || task.Code != 75 {
+		t.Fatalf("HTTP task = %#v, %v", task, err)
+	}
+	var sawTool, sawTask bool
+	for _, h := range calls {
+		if h.Get("Authorization") != "Bearer from-fd" || h.Get("Mcp-Protocol-Version") != ProtocolVersion {
+			t.Fatalf("headers = %#v", h)
+		}
+		switch h.Get("Mcp-Method") {
+		case "tools/call":
+			sawTool = h.Get("Mcp-Name") == "echo"
+		case "tasks/get":
+			sawTask = h.Get("Mcp-Name") == "task-7"
+		}
+	}
+	if !sawTool || !sawTask {
+		t.Fatalf("routing headers: tool=%v task=%v", sawTool, sawTask)
+	}
+}
+
+func TestTaskOutcomeCodes(t *testing.T) {
+	for _, test := range []struct {
+		body string
+		code int
+	}{
+		{`{"resultType":"task","task":{"taskId":"t","status":"working"}}`, 75},
+		{`{"resultType":"task","task":{"taskId":"t","status":"input_required"}}`, 75},
+		{`{"resultType":"task","task":{"taskId":"t","status":"completed","result":{}}}`, 0},
+		{`{"resultType":"task","task":{"taskId":"t","status":"failed","error":{}}}`, 1},
+		{`{"resultType":"task","taskId":"t","status":"completed","result":{}}`, 0},
+		{`{"resultType":"task","taskId":"t","status":"failed","error":{}}`, 1},
+		{`{"resultType":"complete","taskId":"t","status":"cancelled"}`, 1},
+	} {
+		if got := resultCode([]byte(test.body)); got != test.code {
+			t.Errorf("resultCode(%s) = %d, want %d", test.body, got, test.code)
+		}
+	}
+}
+
+func TestReadHeadersRejectsProtocolOwnedFields(t *testing.T) {
+	headers, err := ReadHeaders(strings.NewReader("Authorization: Bearer secret\nX-Tenant: acme\n"), 1024)
+	if err != nil || headers.Get("X-Tenant") != "acme" {
+		t.Fatalf("headers = %#v, %v", headers, err)
+	}
+	if _, err := ReadHeaders(strings.NewReader("Mcp-Method: tools/call\n"), 1024); err == nil {
+		t.Fatal("accepted protocol-owned HTTP header")
+	}
+}
+
 func TestToolChecksDescriptorBeforeCall(t *testing.T) {
 	endpoint := helperEndpoint(t, "ok")
 	disc, err := Discover(context.Background(), endpoint, Options{})
@@ -122,6 +215,27 @@ func TestPromptAndResourceCheckDescriptors(t *testing.T) {
 	}
 }
 
+func TestTemplateResourceChecksDescriptorAndExpansion(t *testing.T) {
+	endpoint := helperEndpoint(t, "ok")
+	disc, err := Discover(context.Background(), endpoint, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := "doc://guide/{chapter}"
+	descriptor := []byte(`{"uriTemplate":"doc://guide/{chapter}","name":"guide chapter","description":"one chapter"}`)
+	digest, err := admit.Digest("templates", endpoint, disc.Raw, descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := ReadTemplateResource(context.Background(), endpoint, template, "doc://guide/intro", digest, Options{})
+	if err != nil || out.Code != 0 || !strings.Contains(string(out.Raw), `"doc://guide/intro"`) {
+		t.Fatalf("template read = %#v, %v", out, err)
+	}
+	if _, err := ReadTemplateResource(context.Background(), endpoint, template, "doc://other/intro", digest, Options{}); err == nil {
+		t.Fatal("accepted URI outside admitted template")
+	}
+}
+
 func TestExplicitContinuationAndTaskExtension(t *testing.T) {
 	endpoint := helperEndpoint(t, "input-required")
 	first, err := Request(context.Background(), endpoint, "tools/call", json.RawMessage(`{"name":"echo","arguments":{}}`), Options{})
@@ -139,7 +253,7 @@ func TestExplicitContinuationAndTaskExtension(t *testing.T) {
 		t.Fatalf("continued = %#v, %v", second, err)
 	}
 
-	task, err := Request(context.Background(), helperEndpoint(t, "ok"), "io.modelcontextprotocol/tasks/get", json.RawMessage(`{"taskId":"t-1"}`), Options{})
+	task, err := Request(context.Background(), helperEndpoint(t, "ok"), "tasks/get", json.RawMessage(`{"taskId":"t-1"}`), Options{})
 	if err != nil || task.Code != 75 || !strings.Contains(string(task.Raw), `"status":"working"`) {
 		t.Fatalf("task = %#v, %v", task, err)
 	}
@@ -147,12 +261,19 @@ func TestExplicitContinuationAndTaskExtension(t *testing.T) {
 
 func TestListenEmitsJSONLAndDoesNotReconnect(t *testing.T) {
 	var stream bytes.Buffer
-	err := Listen(context.Background(), helperEndpoint(t, "listen"), Options{Timeout: 100 * time.Millisecond, Listen: &stream})
+	err := Listen(context.Background(), helperEndpoint(t, "listen"), Options{
+		Timeout:       100 * time.Millisecond,
+		Listen:        &stream,
+		Subscriptions: json.RawMessage(`{"notifications":{"toolsListChanged":true,"taskIds":["t-1"]}}`),
+	})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Listen error = %v", err)
 	}
 	if got := stream.String(); !strings.Contains(got, `"method":"notifications/tools/list_changed"`) {
 		t.Fatalf("stream = %q", got)
+	}
+	if got := stream.String(); !strings.Contains(got, `"method":"notifications/subscriptions/acknowledged"`) || !strings.Contains(got, `"method":"notifications/tasks"`) {
+		t.Fatalf("extension stream = %q", got)
 	}
 }
 
@@ -285,7 +406,15 @@ func serveHelper(mode string, extra []string) {
 				"uri": "doc://guide", "name": "guide", "description": "the guide",
 			}}})
 		case "resources/read":
-			writeResponse(enc, req.ID, map[string]any{"contents": []any{map[string]any{"uri": "doc://guide", "text": "hello"}}})
+			var p struct {
+				URI string `json:"uri"`
+			}
+			_ = json.Unmarshal(req.Params, &p)
+			writeResponse(enc, req.ID, map[string]any{"contents": []any{map[string]any{"uri": p.URI, "text": "hello"}}})
+		case "resources/templates/list":
+			writeResponse(enc, req.ID, map[string]any{"resultType": "complete", "resourceTemplates": []any{map[string]any{
+				"uriTemplate": "doc://guide/{chapter}", "name": "guide chapter", "description": "one chapter",
+			}}})
 		case "tools/call":
 			switch mode {
 			case "drop":
@@ -335,11 +464,12 @@ func serveHelper(mode string, extra []string) {
 					"unknown":           map[string]any{"kept": true},
 				})
 			}
-		case "io.modelcontextprotocol/tasks/get":
+		case "tasks/get":
 			writeResponse(enc, req.ID, map[string]any{"taskId": "t-1", "status": "working"})
 		case "subscriptions/listen":
-			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged", "params": map[string]any{}})
+			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged", "params": map[string]any{"notifications": map[string]any{"toolsListChanged": true, "taskIds": []string{"t-1"}}}})
 			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/tools/list_changed", "params": map[string]any{}})
+			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/tasks", "params": map[string]any{"taskId": "t-1", "status": "working"}})
 		default:
 			writeError(enc, req.ID, -32601, "method not found")
 		}

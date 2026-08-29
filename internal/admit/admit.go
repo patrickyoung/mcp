@@ -17,6 +17,7 @@ type Endpoint struct {
 	Command string   `json:"command"`
 	Args    []string `json:"args,omitempty"`
 	Path    string   `json:"path,omitempty"`
+	URL     string   `json:"url,omitempty"`
 }
 
 // Canonical returns compact JSON with stable object-key ordering.

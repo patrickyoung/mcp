@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,14 +25,15 @@ type recorder struct {
 	methods map[string]string
 	last    map[string]wireResponse
 
-	begin       bool
-	effect      bool
-	targetID    string
-	target      wireResponse
-	targetReady bool
-	sent        bool
-	duplicate   chan struct{}
-	dupOnce     sync.Once
+	begin                  bool
+	effect                 bool
+	targetID               string
+	target                 wireResponse
+	targetReady            bool
+	sent                   bool
+	duplicate              chan struct{}
+	dupOnce                sync.Once
+	extensionNotifications *jsonlWriter
 }
 
 func (r *recorder) transport(inner mcp.Transport) mcp.Transport {
@@ -130,32 +132,52 @@ func (c *recordingConnection) Write(ctx context.Context, msg jsonrpc.Message) er
 }
 
 func (c *recordingConnection) Read(ctx context.Context) (jsonrpc.Message, error) {
-	msg, err := c.Connection.Read(ctx)
-	if err != nil {
-		return nil, err
-	}
-	res, ok := msg.(*jsonrpc.Response)
-	if !ok {
+	for {
+		msg, err := c.Connection.Read(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if req, ok := msg.(*jsonrpc.Request); ok && !req.IsCall() && interceptNotification(req.Method) {
+			c.recorder.extensionNotifications.writeRaw(req.Method, req.Params)
+			continue
+		}
+		res, ok := msg.(*jsonrpc.Response)
+		if !ok {
+			return msg, nil
+		}
+		wr := wireResponse{Result: append(json.RawMessage(nil), res.Result...)}
+		if res.Error != nil {
+			wr.Error, _ = json.Marshal(res.Error)
+		}
+		key := idKey(res.ID)
+		c.recorder.mu.Lock()
+		if method := c.recorder.methods[key]; method != "" {
+			c.recorder.last[method] = wr
+		}
+		if key == c.recorder.targetID {
+			if c.recorder.targetReady {
+				c.recorder.dupOnce.Do(func() { close(c.recorder.duplicate) })
+			}
+			c.recorder.target = wr
+			c.recorder.targetReady = true
+		}
+		c.recorder.mu.Unlock()
 		return msg, nil
 	}
-	wr := wireResponse{Result: append(json.RawMessage(nil), res.Result...)}
-	if res.Error != nil {
-		wr.Error, _ = json.Marshal(res.Error)
+}
+
+func interceptNotification(method string) bool {
+	if method == "notifications/subscriptions/acknowledged" || method == "notifications/tasks" {
+		return true
 	}
-	key := idKey(res.ID)
-	c.recorder.mu.Lock()
-	if method := c.recorder.methods[key]; method != "" {
-		c.recorder.last[method] = wr
+	switch method {
+	case "notifications/cancelled", "notifications/progress", "notifications/tools/list_changed",
+		"notifications/prompts/list_changed", "notifications/resources/list_changed",
+		"notifications/resources/updated", "notifications/message",
+		"notifications/elicitation/complete", "notifications/roots/list_changed":
+		return false
 	}
-	if key == c.recorder.targetID {
-		if c.recorder.targetReady {
-			c.recorder.dupOnce.Do(func() { close(c.recorder.duplicate) })
-		}
-		c.recorder.target = wr
-		c.recorder.targetReady = true
-	}
-	c.recorder.mu.Unlock()
-	return msg, nil
+	return strings.HasPrefix(method, "notifications/")
 }
 
 func idKey(id jsonrpc.ID) string {

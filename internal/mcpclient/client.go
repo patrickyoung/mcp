@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/patrickyoung/mcp/internal/admit"
+	"github.com/yosida95/uritemplate/v3"
 )
 
 const (
@@ -28,12 +31,16 @@ const (
 type Endpoint = admit.Endpoint
 
 type Options struct {
-	Timeout   time.Duration
-	MaxInput  int64
-	MaxOutput int64
-	Stderr    io.Writer
-	Events    io.Writer
-	Listen    io.Writer
+	Timeout       time.Duration
+	MaxInput      int64
+	MaxOutput     int64
+	Stderr        io.Writer
+	Events        io.Writer
+	Listen        io.Writer
+	Headers       http.Header
+	Capabilities  map[string]any
+	Subscriptions json.RawMessage
+	RouteName     string
 }
 
 type Outcome struct {
@@ -52,6 +59,12 @@ type session struct {
 func ResolveEndpoint(argv []string) (Endpoint, error) {
 	if len(argv) == 0 {
 		return Endpoint{}, fmt.Errorf("missing server command")
+	}
+	if len(argv) == 1 {
+		u, err := url.Parse(argv[0])
+		if err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
+			return Endpoint{Type: "http", URL: u.String()}, nil
+		}
 	}
 	command, err := exec.LookPath(argv[0])
 	if err != nil {
@@ -120,7 +133,7 @@ func Request(ctx context.Context, endpoint Endpoint, method string, params json.
 		return Outcome{}, err
 	}
 	defer s.conn.Close()
-	s.recorder.Begin(true)
+	s.recorder.Begin(methodMayEffect(method))
 	err = callStandardOrCustom(runCtx, s.client, s.conn, method, params)
 	return finish(ctx, s.recorder, err)
 }
@@ -195,7 +208,7 @@ func Prompt(ctx context.Context, endpoint Endpoint, name, expected string, argum
 	if err := json.Unmarshal(arguments, &args); err != nil {
 		return Outcome{}, fmt.Errorf("prompt arguments must be a JSON object of strings: %w", err)
 	}
-	s.recorder.Begin(true)
+	s.recorder.Begin(false)
 	_, err = s.conn.GetPrompt(runCtx, &mcp.GetPromptParams{Name: name, Arguments: args})
 	return finish(ctx, s.recorder, err)
 }
@@ -225,16 +238,51 @@ func ReadResource(ctx context.Context, endpoint Endpoint, uri, expected string, 
 	if digest != expected {
 		return Outcome{}, fmt.Errorf("resource %q descriptor changed: expected %s, got %s", uri, expected, digest)
 	}
-	s.recorder.Begin(true)
+	s.recorder.Begin(false)
+	_, err = s.conn.ReadResource(runCtx, &mcp.ReadResourceParams{URI: uri})
+	return finish(ctx, s.recorder, err)
+}
+
+// ReadTemplateResource verifies an admitted URI-template descriptor, verifies
+// that uri is an expansion of it, and then reads the concrete URI.
+func ReadTemplateResource(ctx context.Context, endpoint Endpoint, template, uri, expected string, opts Options) (Outcome, error) {
+	if template == "" || uri == "" || expected == "" {
+		return Outcome{}, fmt.Errorf("resource template, URI, and expected descriptor digest are required")
+	}
+	runCtx, cancel := withTimeout(ctx, opts.Timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+	s, err := connect(runCtx, endpoint, opts, false)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer s.conn.Close()
+	descriptor, err := findTemplate(runCtx, s, template)
+	if err != nil {
+		return Outcome{}, err
+	}
+	digest, err := admit.Digest("templates", endpoint, s.discovery, descriptor)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if digest != expected {
+		return Outcome{}, fmt.Errorf("resource template %q descriptor changed: expected %s, got %s", template, expected, digest)
+	}
+	tmpl, err := uritemplate.New(template)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("invalid admitted resource template %q: %w", template, err)
+	}
+	if tmpl.Match(uri) == nil {
+		return Outcome{}, fmt.Errorf("resource URI %q is not an expansion of admitted template %q", uri, template)
+	}
+	s.recorder.Begin(false)
 	_, err = s.conn.ReadResource(runCtx, &mcp.ReadResourceParams{URI: uri})
 	return finish(ctx, s.recorder, err)
 }
 
 func connect(parent context.Context, endpoint Endpoint, opts Options, listening bool) (*session, error) {
 	ctx := parent
-	if endpoint.Type != "stdio" || endpoint.Command == "" {
-		return nil, fmt.Errorf("only an explicit stdio endpoint is supported")
-	}
 	stderr := opts.Stderr
 	if stderr == nil {
 		stderr = io.Discard
@@ -243,13 +291,24 @@ func connect(parent context.Context, endpoint Endpoint, opts Options, listening 
 	if maxOutput <= 0 {
 		maxOutput = DefaultMaxWire
 	}
-	base := &commandTransport{endpoint: endpoint, stderr: stderr, maxOutput: maxOutput, grace: time.Second}
+	base, err := endpointTransport(endpoint, opts, stderr, maxOutput)
+	if err != nil {
+		return nil, err
+	}
 	rec := new(recorder)
 
 	events := &jsonlWriter{w: opts.Events}
 	listen := &jsonlWriter{w: opts.Listen}
+	rec.extensionNotifications = events
+	if listening {
+		rec.extensionNotifications = listen
+	}
+	capabilities, err := clientCapabilities(opts.Capabilities)
+	if err != nil {
+		return nil, err
+	}
 	clientOpts := &mcp.ClientOptions{
-		Capabilities:   &mcp.ClientCapabilities{},
+		Capabilities:   capabilities,
 		MultiRoundTrip: &mcp.MultiRoundTripOptions{Disabled: true},
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
@@ -257,6 +316,9 @@ func connect(parent context.Context, endpoint Endpoint, opts Options, listening 
 		},
 	}
 	if listening {
+		clientOpts.ElicitationCompleteHandler = func(_ context.Context, req *mcp.ElicitationCompleteNotificationRequest) {
+			listen.write("notifications/elicitation/complete", req.Params)
+		}
 		clientOpts.ToolListChangedHandler = func(_ context.Context, req *mcp.ToolListChangedRequest) {
 			listen.write("notifications/tools/list_changed", req.Params)
 		}
@@ -269,8 +331,11 @@ func connect(parent context.Context, endpoint Endpoint, opts Options, listening 
 		clientOpts.ResourceUpdatedHandler = func(_ context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
 			listen.write("notifications/resources/updated", req.Params)
 		}
+		clientOpts.LoggingMessageHandler = func(_ context.Context, req *mcp.LoggingMessageRequest) {
+			listen.write("notifications/message", req.Params)
+		}
 	}
-	c := mcp.NewClient(&mcp.Implementation{Name: "unix-mcp", Version: "0.1.0"}, clientOpts)
+	c := mcp.NewClient(&mcp.Implementation{Name: "unix-mcp", Version: "0.2.0"}, clientOpts)
 	cs, err := c.Connect(ctx, rec.transport(base), nil)
 	if err != nil {
 		return nil, classifyBeforeEffect(parent, err)
@@ -302,6 +367,10 @@ func Listen(ctx context.Context, endpoint Endpoint, opts Options) error {
 		return err
 	}
 	defer s.conn.Close()
+	listenErr := startSubscriptions(runCtx, s, opts.Subscriptions)
+	if listenErr != nil {
+		return listenErr
+	}
 	done := make(chan error, 1)
 	go func() { done <- s.conn.Wait() }()
 	select {
@@ -313,6 +382,58 @@ func Listen(ctx context.Context, endpoint Endpoint, opts Options) error {
 		}
 		return err
 	}
+}
+
+func clientCapabilities(extra map[string]any) (*mcp.ClientCapabilities, error) {
+	// A Unix caller can preserve task handles, inspect polymorphic results, and
+	// issue every task lifecycle request, so task support is truthful by
+	// default. Other extensions and deprecated client capabilities are explicit.
+	caps := &mcp.ClientCapabilities{}
+	caps.AddExtension("io.modelcontextprotocol/tasks", nil)
+	if extra == nil {
+		return caps, nil
+	}
+	raw, err := json.Marshal(extra)
+	if err != nil {
+		return nil, fmt.Errorf("client capabilities: %w", err)
+	}
+	if err := json.Unmarshal(raw, caps); err != nil {
+		return nil, fmt.Errorf("client capabilities: %w", err)
+	}
+	if caps.Extensions == nil {
+		caps.Extensions = make(map[string]any)
+	}
+	if _, ok := caps.Extensions["io.modelcontextprotocol/tasks"]; !ok {
+		caps.AddExtension("io.modelcontextprotocol/tasks", nil)
+	}
+	return caps, nil
+}
+
+const unixListenMethod = "io.patrickyoung.unix/subscriptions-listen"
+
+func startSubscriptions(ctx context.Context, s *session, subscriptions json.RawMessage) error {
+	// v1.7.0 implements subscriptions/listen but does not yet export the
+	// ClientSession method. A sending middleware changes only the local alias;
+	// the official SDK still supplies metadata, owns the call, dispatches
+	// notifications, and puts subscriptions/listen on the wire.
+	if err := mcp.AddSendingCustomMethod[*rawParams, *rawResult](s.client, unixListenMethod); err != nil {
+		return err
+	}
+	s.client.AddSendingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			if method != unixListenMethod {
+				return next(ctx, method, req)
+			}
+			_, err := next(ctx, "subscriptions/listen", req)
+			return &rawResult{}, err
+		}
+	})
+	params := subscriptions
+	if len(bytes.TrimSpace(params)) == 0 || string(bytes.TrimSpace(params)) == "{}" {
+		params = json.RawMessage(`{"notifications":{"toolsListChanged":true,"promptsListChanged":true,"resourcesListChanged":true}}`)
+	}
+	_, err := mcp.CallCustomMethod[*rawParams, *rawResult](ctx, s.conn, unixListenMethod, &rawParams{raw: params})
+	return err
 }
 
 func findTool(ctx context.Context, s *session, name string) (json.RawMessage, error) {
@@ -411,6 +532,37 @@ func findResource(ctx context.Context, s *session, uri string) (json.RawMessage,
 	}
 }
 
+func findTemplate(ctx context.Context, s *session, uriTemplate string) (json.RawMessage, error) {
+	cursor := ""
+	for {
+		s.recorder.Begin(false)
+		_, err := s.conn.ListResourceTemplates(ctx, &mcp.ListResourceTemplatesParams{Cursor: cursor})
+		outcome, finishErr := finish(ctx, s.recorder, err)
+		if finishErr != nil {
+			return nil, finishErr
+		}
+		var page struct {
+			Templates  []json.RawMessage `json:"resourceTemplates"`
+			NextCursor string            `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(outcome.Raw, &page); err != nil {
+			return nil, fmt.Errorf("resources/templates/list result: %w", err)
+		}
+		for _, raw := range page.Templates {
+			var head struct {
+				URITemplate string `json:"uriTemplate"`
+			}
+			if json.Unmarshal(raw, &head) == nil && head.URITemplate == uriTemplate {
+				return raw, nil
+			}
+		}
+		if page.NextCursor == "" {
+			return nil, fmt.Errorf("resource template %q is no longer advertised", uriTemplate)
+		}
+		cursor = page.NextCursor
+	}
+}
+
 func finish(parent context.Context, rec *recorder, callErr error) (Outcome, error) {
 	response, ready := rec.Target()
 	if callErr != nil {
@@ -446,6 +598,9 @@ func resultCode(raw []byte) int {
 		IsError    bool   `json:"isError"`
 		ResultType string `json:"resultType"`
 		Status     string `json:"status"`
+		Task       *struct {
+			Status string `json:"status"`
+		} `json:"task"`
 	}
 	if json.Unmarshal(raw, &result) != nil {
 		return 0
@@ -453,13 +608,41 @@ func resultCode(raw []byte) int {
 	if result.IsError {
 		return 1
 	}
-	if result.ResultType == "input_required" || result.Status == "working" || result.Status == "input_required" {
+	if result.Task != nil {
+		switch result.Task.Status {
+		case "working", "input_required":
+			return 75
+		case "failed", "cancelled":
+			return 1
+		case "completed":
+			return 0
+		}
+	}
+	switch result.Status {
+	case "working", "input_required":
+		return 75
+	case "failed", "cancelled":
+		return 1
+	case "completed":
+		return 0
+	}
+	if result.ResultType == "input_required" || result.ResultType == "task" {
 		return 75
 	}
-	if result.Status == "failed" || result.Status == "cancelled" {
-		return 1
-	}
 	return 0
+}
+
+func methodMayEffect(method string) bool {
+	switch method {
+	case "tools/list", "prompts/list", "prompts/get", "resources/list",
+		"resources/templates/list", "resources/read", "completion/complete", "tasks/get":
+		return false
+	default:
+		// Unknown extension requests are conservatively effectful. Extension
+		// authors may put an observation behind mcp request, but a lost response
+		// must never invite an automatic replay of an unclassified method.
+		return true
+	}
 }
 
 type ExitError struct {
@@ -472,12 +655,6 @@ func (e *ExitError) Unwrap() error { return e.Err }
 
 func callStandardOrCustom(ctx context.Context, c *mcp.Client, cs *mcp.ClientSession, method string, raw json.RawMessage) error {
 	switch method {
-	case "ping":
-		var p mcp.PingParams
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return err
-		}
-		return cs.Ping(ctx, &p)
 	case "tools/list":
 		var p mcp.ListToolsParams
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -534,14 +711,10 @@ func callStandardOrCustom(ctx context.Context, c *mcp.Client, cs *mcp.ClientSess
 		}
 		_, err := cs.Complete(ctx, &p)
 		return err
-	case "logging/setLevel":
-		var p mcp.SetLoggingLevelParams
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return err
-		}
-		return cs.SetLoggingLevel(ctx, &p)
-	case "server/discover", "initialize":
+	case "server/discover":
 		return fmt.Errorf("%s is lifecycle machinery; use mcp discover", method)
+	case "initialize", "ping", "logging/setLevel", "resources/subscribe", "resources/unsubscribe":
+		return fmt.Errorf("%s was removed from modern stateless MCP", method)
 	}
 
 	p := &rawParams{raw: append(json.RawMessage(nil), raw...)}
@@ -631,6 +804,23 @@ func (w *jsonlWriter) write(method string, params any) {
 		Method string `json:"method"`
 		Params any    `json:"params,omitempty"`
 	}{method, params}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, _ = w.w.Write(append(raw, '\n'))
+}
+
+func (w *jsonlWriter) writeRaw(method string, params json.RawMessage) {
+	if w == nil || w.w == nil {
+		return
+	}
+	record := struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params,omitempty"`
+	}{method, append(json.RawMessage(nil), params...)}
 	raw, err := json.Marshal(record)
 	if err != nil {
 		return

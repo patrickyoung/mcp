@@ -8,6 +8,9 @@ the exact result.
 `mcpbox` compiles one server's discovery result into a folder whose executable
 entries are the exact capabilities an operator admitted.
 
+`mcpserve` publishes declared MCP capabilities while running each behavior as
+one ordinary Unix filter process.
+
 ## Boundary
 
 MCP remains a wire protocol at the edge. Inside a Unix worker it becomes
@@ -19,13 +22,15 @@ None of them imports this code or learns MCP.
 The protocol implementation comes from
 `github.com/modelcontextprotocol/go-sdk`. This repository adds:
 
-- exact stdio argv and process-group lifetime;
+- exact stdio argv, stateless Streamable HTTP, and process-group lifetime;
 - bounded JSON stdin and bounded server output;
 - result-byte capture before typed SDK decoding can discard unknown fields;
 - an irreversible sent boundary and exit 125 after uncertain effects;
 - explicit JSONL progress and subscription streams;
 - descriptor-digest admission and runtime verification;
-- staged, atomic folder generation.
+- RFC 6570 template admission and expansion checks;
+- staged, atomic folder generation;
+- a reverse adapter from MCP requests to bounded Unix filter processes.
 
 ## Capability folder
 
@@ -53,6 +58,7 @@ server.mcp/
   resources/
   bin/
     read
+    read-template
 ```
 
 The per-item catalogues are convenient Unix streams. The page catalogues
@@ -89,30 +95,68 @@ server process.
 - Tools have generated, digest-checked executable wrappers.
 - Prompts have separate operator-invoked, digest-checked filters.
 - Exact resources use a generated allowlisting reader.
-- Resource templates remain visible catalogues until a safe expansion and
-  admission contract is specified.
+- Resource templates have a whole-template admission. The reader verifies the
+  descriptor, then requires the concrete URI to match its RFC 6570 template.
 - Completion and extension Tasks use ordinary `mcp request` calls.
 - MRTR input requests are returned as data with exit 75; a caller explicitly
   retries with `requestState` and `inputResponses`.
-- Subscriptions are one foreground JSONL stream and never reconnect.
+- Subscriptions are a real `subscriptions/listen` request exposed as one
+  foreground JSONL stream and never reconnect.
+- Streamable HTTP refuses redirects and SDK retries. Credentials enter through
+  an explicit header descriptor, never argv or a generated folder.
 - Images, audio, embedded resources, MCP Apps payloads, structured content,
   and unknown `_meta` remain in the exact result JSON.
 - Deprecated roots, sampling, and logging receive no ambient handler. A future
   compatibility program may provide explicitly selected handlers.
 
+## Reverse edge
+
+`mcpserve` separates descriptions from behavior. A JSON manifest supplies the
+server identity, capability descriptors, and extension method names. The
+official SDK owns `server/discover`, list pagination, subscriptions, request
+routing, metadata, cancellation, and stdio or stateless HTTP framing.
+
+For a call, one dispatcher process receives:
+
+```text
+argv    configured dispatcher argv + MCP method
+stdin   one params JSON object
+stdout  one result object
+stderr  unchanged diagnostics
+fd 3    zero or more progress/log notification envelopes as JSONL
+```
+
+Exit 0 accepts the result. Exit 1 accepts only a JSON-RPC error object. Every
+other exit is an execution failure. Input, output, event-line size, duration,
+and the entire process group are bounded or operator-controlled. The manifest
+can expose Tools, Prompts, Resources, Resource Templates, Completion, and
+arbitrary extension methods such as Tasks without teaching the dispatcher
+about MCP framing or connection state.
+
+Tasks remain an extension without becoming an in-process framework. The
+manifest advertises the extension and names its three lifecycle methods;
+`mcpserve` validates capability negotiation, HTTP `Mcp-Name` routing,
+polymorphic creation results, task state, and acknowledgement envelopes. The
+dispatcher owns durable creation and lookup, so Tend, SQLite, files, or a
+remote service can implement the state machine independently.
+
+A manifest is immutable for one server process and consequently advertises no
+list-change or legacy resource-subscription capability. An attempted false
+claim is rejected at startup. Replacing the process is the Unix configuration
+change boundary.
+
 ## Not present
 
-No daemon, connection pool, registry, endpoint config search, OAuth token
-store, hidden retry, hidden MRTR callback, task database, task poller, prompt
-installer, resource index, Apps renderer, model client, approval path,
-confinement path, or second trace.
+No daemon, connection pool, registry, endpoint config search, OAuth flow or
+token store, TLS termination, hidden retry, hidden MRTR callback, task
+database, task poller, prompt installer, resource index, Apps renderer, model
+client, approval path, confinement path, or second trace. HTTP authorization
+is composed with an operator-owned reverse proxy or explicit header producer.
 
 ## Next slices
 
-1. Add Streamable HTTP with the SDK and an operator-owned credential helper.
-2. Add safe template URI expansion with descriptor-bound admission.
-3. Add `mcp-unpack` for digest-named materialization of binary content.
-4. Add the foreground `mcpserve` CGI-like adapter for exporting explicit Unix
-   capability directories.
-5. Add an optional Registry search filter that writes endpoint proposals and
+1. Add `mcp-unpack` for digest-named materialization of binary content.
+2. Add an explicit legacy compatibility process if a real deployment requires
+   pre-2026 stateful sessions.
+3. Add an optional Registry search filter that writes endpoint proposals and
    never installs or executes them.

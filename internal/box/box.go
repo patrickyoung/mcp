@@ -23,8 +23,9 @@ import (
 var safeName = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
 
 type Config struct {
-	MCP    string
-	Stderr io.Writer
+	MCP     string
+	Stderr  io.Writer
+	Headers string
 }
 
 type catalogSpec struct {
@@ -75,7 +76,7 @@ func Make(ctx context.Context, target string, endpoint admit.Endpoint, cfg Confi
 	if err != nil {
 		return err
 	}
-	discovery, err := invoke(ctx, mcpPath, endpoint, "discover", "", nil, cfg.Stderr)
+	discovery, err := invoke(ctx, mcpPath, endpoint, "discover", "", nil, cfg.Stderr, cfg.Headers)
 	if err != nil {
 		return fmt.Errorf("discovering server: %w", err)
 	}
@@ -99,7 +100,7 @@ func Make(ctx context.Context, target string, endpoint admit.Endpoint, cfg Confi
 		itemsPath := filepath.Join(stage, "catalog", spec.file)
 		pagesPath := filepath.Join(stage, "catalog", strings.TrimSuffix(spec.file, ".jsonl")+".pages.jsonl")
 		if _, advertised := capabilities[spec.capability]; advertised {
-			items, pages, err := fetchCatalog(ctx, mcpPath, endpoint, spec, cfg.Stderr)
+			items, pages, err := fetchCatalog(ctx, mcpPath, endpoint, spec, cfg.Stderr, cfg.Headers)
 			if err != nil {
 				return err
 			}
@@ -163,9 +164,6 @@ func Admit(dir, kind string, names []string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	if spec.kind == "templates" {
-		return fmt.Errorf("resource templates are catalogued but expansion admission is not implemented")
-	}
 	endpoint, discovery, entries, err := loadCatalog(dir, spec)
 	if err != nil {
 		return err
@@ -207,6 +205,8 @@ func Admit(dir, kind string, names []string, cfg Config) error {
 		return renderPrompts(dir, endpoint, byName, admissions, cfg)
 	case "resources":
 		return renderRead(dir, endpoint, byName, admissions, cfg)
+	case "templates":
+		return renderTemplateRead(dir, endpoint, admissions, cfg)
 	}
 	return nil
 }
@@ -243,6 +243,11 @@ func Revoke(dir, kind string, names []string, cfg Config) error {
 			return err
 		}
 	}
+	if spec.kind == "templates" {
+		if err := renderTemplateRead(dir, admit.Endpoint{}, admissions, cfg); err != nil {
+			return err
+		}
+	}
 	return writeAdmissionsAtomic(path, admissions)
 }
 
@@ -255,8 +260,9 @@ func Show(w io.Writer, dir string) error {
 	if err := json.Unmarshal(endpointRaw, &endpoint); err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "endpoint\t%s", endpoint.Command)
-	for _, arg := range endpoint.Args {
+	endpointArgs := endpointArgv(endpoint)
+	fmt.Fprint(w, "endpoint")
+	for _, arg := range endpointArgs {
 		fmt.Fprintf(w, "\t%s", arg)
 	}
 	fmt.Fprintln(w)
@@ -289,14 +295,14 @@ func Diff(ctx context.Context, oldDir, newDir string, stdout, stderr io.Writer) 
 	return 2, err
 }
 
-func fetchCatalog(ctx context.Context, mcpPath string, endpoint admit.Endpoint, spec catalogSpec, stderr io.Writer) (items, pages [][]byte, err error) {
+func fetchCatalog(ctx context.Context, mcpPath string, endpoint admit.Endpoint, spec catalogSpec, stderr io.Writer, headers string) (items, pages [][]byte, err error) {
 	cursor := ""
 	for {
 		params := []byte("{}")
 		if cursor != "" {
 			params, _ = json.Marshal(map[string]string{"cursor": cursor})
 		}
-		page, callErr := invoke(ctx, mcpPath, endpoint, "request", spec.method, params, stderr)
+		page, callErr := invoke(ctx, mcpPath, endpoint, "request", spec.method, params, stderr, headers)
 		if callErr != nil {
 			return nil, nil, fmt.Errorf("%s: %w", spec.method, callErr)
 		}
@@ -327,16 +333,26 @@ func fetchCatalog(ctx context.Context, mcpPath string, endpoint admit.Endpoint, 
 }
 
 // invoke runs the public mcp filter with literal argv and JSON stdin.
-func invoke(ctx context.Context, mcpPath string, endpoint admit.Endpoint, command, method string, input []byte, stderr io.Writer) ([]byte, error) {
+func invoke(ctx context.Context, mcpPath string, endpoint admit.Endpoint, command, method string, input []byte, stderr io.Writer, headers string) ([]byte, error) {
 	args := []string{command}
+	var headerFile *os.File
+	if headers != "" {
+		var err error
+		headerFile, err = os.Open(headers)
+		if err != nil {
+			return nil, fmt.Errorf("opening HTTP headers: %w", err)
+		}
+		defer headerFile.Close()
+		args = append(args, "-header-fd", "3")
+	}
 	if command == "request" {
 		if method == "" {
 			return nil, fmt.Errorf("internal request invocation has no method")
 		}
 		args = append(args, method)
 	}
-	args = append(args, "--", endpoint.Command)
-	args = append(args, endpoint.Args...)
+	args = append(args, "--")
+	args = append(args, endpointArgv(endpoint)...)
 	cmd := exec.CommandContext(ctx, mcpPath, args...)
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
@@ -347,6 +363,9 @@ func invoke(ctx context.Context, mcpPath string, endpoint admit.Endpoint, comman
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Stdin = bytes.NewReader(input)
 	cmd.Stderr = stderr
+	if headerFile != nil {
+		cmd.ExtraFiles = []*os.File{headerFile}
+	}
 	if endpoint.Path != "" {
 		cmd.Env = replaceEnv(os.Environ(), "PATH", endpoint.Path)
 	}
@@ -484,10 +503,8 @@ func renderPrompts(dir string, endpoint admit.Endpoint, entries map[string]catal
 		fmt.Fprintf(&body, "# %s\n", oneLine(entry.description))
 		fmt.Fprintf(&body, "# admitted MCP descriptor %s\n", digest)
 		writeRuntimePrefix(&body, endpoint)
-		fmt.Fprintf(&body, "exec %s prompt -expect %s %s -- %s", shellQuote(mcpPath), shellQuote(digest), shellQuote(name), shellQuote(endpoint.Command))
-		for _, arg := range endpoint.Args {
-			fmt.Fprintf(&body, " %s", shellQuote(arg))
-		}
+		fmt.Fprintf(&body, "exec %s $mcp_headers prompt -expect %s %s --", shellQuote(mcpPath), shellQuote(digest), shellQuote(name))
+		writeEndpointArgs(&body, endpoint)
 		fmt.Fprintln(&body)
 		if err := writeAtomic(filepath.Join(dir, "prompts", name), []byte(body.String()), 0o755); err != nil {
 			return err
@@ -526,10 +543,49 @@ func renderRead(dir string, endpoint admit.Endpoint, entries map[string]catalogE
 	fmt.Fprintln(&body, "  *) echo \"read: resource URI is not admitted: $1\" >&2; exit 2 ;;")
 	fmt.Fprintln(&body, "esac")
 	writeRuntimePrefix(&body, endpoint)
-	fmt.Fprintf(&body, "exec %s read -expect \"$expect\" \"$1\" -- %s", shellQuote(mcpPath), shellQuote(endpoint.Command))
-	for _, arg := range endpoint.Args {
-		fmt.Fprintf(&body, " %s", shellQuote(arg))
+	fmt.Fprintf(&body, "exec %s $mcp_headers read -expect \"$expect\" \"$1\" --", shellQuote(mcpPath))
+	writeEndpointArgs(&body, endpoint)
+	fmt.Fprintln(&body)
+	return writeAtomic(path, []byte(body.String()), 0o755)
+}
+
+func renderTemplateRead(dir string, endpoint admit.Endpoint, admissions map[string]string, cfg Config) error {
+	path := filepath.Join(dir, "bin", "read-template")
+	if len(admissions) == 0 {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
 	}
+	if endpoint.Type == "" {
+		var err error
+		endpoint, _, _, err = loadCatalog(dir, catalogs[0])
+		if err != nil {
+			return err
+		}
+	}
+	mcpPath, err := runtimeMCP(dir, cfg)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(admissions))
+	for name := range admissions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var body strings.Builder
+	fmt.Fprintln(&body, "#!/bin/sh")
+	fmt.Fprintln(&body, "# read a URI through one explicitly admitted MCP resource template")
+	fmt.Fprintln(&body, "test \"$#\" -eq 2 || { echo 'usage: read-template TEMPLATE URI' >&2; exit 2; }")
+	fmt.Fprintln(&body, "case $1 in")
+	for _, tmpl := range names {
+		fmt.Fprintf(&body, "  %s) expect=%s ;;\n", shellQuote(tmpl), shellQuote(admissions[tmpl]))
+	}
+	fmt.Fprintln(&body, "  *) echo \"read-template: resource template is not admitted: $1\" >&2; exit 2 ;;")
+	fmt.Fprintln(&body, "esac")
+	writeRuntimePrefix(&body, endpoint)
+	fmt.Fprintf(&body, "exec %s $mcp_headers template-read -expect \"$expect\" \"$1\" \"$2\" --", shellQuote(mcpPath))
+	writeEndpointArgs(&body, endpoint)
 	fmt.Fprintln(&body)
 	return writeAtomic(path, []byte(body.String()), 0o755)
 }
@@ -540,10 +596,8 @@ func renderTool(mcpPath string, endpoint admit.Endpoint, name, digest, descripti
 	fmt.Fprintf(&body, "# %s\n", oneLine(description))
 	fmt.Fprintf(&body, "# admitted MCP descriptor %s\n", digest)
 	writeRuntimePrefix(&body, endpoint)
-	fmt.Fprintf(&body, "exec %s tool -expect %s %s -- %s", shellQuote(mcpPath), shellQuote(digest), shellQuote(name), shellQuote(endpoint.Command))
-	for _, arg := range endpoint.Args {
-		fmt.Fprintf(&body, " %s", shellQuote(arg))
-	}
+	fmt.Fprintf(&body, "exec %s $mcp_headers tool -expect %s %s --", shellQuote(mcpPath), shellQuote(digest), shellQuote(name))
+	writeEndpointArgs(&body, endpoint)
 	fmt.Fprintln(&body)
 	return body.String()
 }
@@ -551,6 +605,26 @@ func renderTool(mcpPath string, endpoint admit.Endpoint, name, digest, descripti
 func writeRuntimePrefix(body *strings.Builder, endpoint admit.Endpoint) {
 	if endpoint.Path != "" {
 		fmt.Fprintf(body, "PATH=%s; export PATH\n", shellQuote(endpoint.Path))
+	}
+	if endpoint.Type == "http" {
+		fmt.Fprintln(body, "mcp_headers=")
+		fmt.Fprintln(body, "if test -n \"${MCP_HEADERS-}\"; then")
+		fmt.Fprintln(body, "  exec 3<\"$MCP_HEADERS\" || exit 2")
+		fmt.Fprintln(body, "  mcp_headers='-header-fd 3'")
+		fmt.Fprintln(body, "fi")
+	}
+}
+
+func endpointArgv(endpoint admit.Endpoint) []string {
+	if endpoint.Type == "http" {
+		return []string{endpoint.URL}
+	}
+	return append([]string{endpoint.Command}, endpoint.Args...)
+}
+
+func writeEndpointArgs(body *strings.Builder, endpoint admit.Endpoint) {
+	for _, arg := range endpointArgv(endpoint) {
+		fmt.Fprintf(body, " %s", shellQuote(arg))
 	}
 }
 

@@ -101,6 +101,14 @@ func TestMakeGrantsNothingUntilAdmit(t *testing.T) {
 	if err := exec.Command(read, "doc://secret").Run(); err == nil {
 		t.Fatal("resource reader accepted an unadmitted URI")
 	}
+
+	if err := Admit(target, "templates", []string{"doc://guide/{chapter}"}, Config{MCP: fake}); err != nil {
+		t.Fatal(err)
+	}
+	templateRead := filepath.Join(target, "bin", "read-template")
+	if out, err := exec.Command(templateRead, "doc://guide/{chapter}", "doc://guide/intro").Output(); err != nil || !strings.Contains(string(out), `"contents"`) {
+		t.Fatalf("template reader: %s, %v", out, err)
+	}
 }
 
 func TestMakeFailureLeavesNoDestination(t *testing.T) {
@@ -134,7 +142,7 @@ case "$1" in
       tools/list) printf '%s\n' '{"resultType":"complete","tools":[{"name":"echo","description":"echo exact JSON","inputSchema":{"type":"object"}},{"name":"remote-schema","description":"unsafe remote schema","inputSchema":{"$ref":"https://example.invalid/schema.json"}}]}' ;;
       prompts/list) printf '%s\n' '{"resultType":"complete","prompts":[{"name":"review","description":"review a change","arguments":[{"name":"tone"}]}]}' ;;
       resources/list) printf '%s\n' '{"resultType":"complete","resources":[{"uri":"doc://guide","name":"guide","description":"the guide"}]}' ;;
-      resources/templates/list) printf '%s\n' '{"resultType":"complete","resourceTemplates":[]}' ;;
+      resources/templates/list) printf '%s\n' '{"resultType":"complete","resourceTemplates":[{"uriTemplate":"doc://guide/{chapter}","name":"guide chapter","description":"one chapter"}]}' ;;
       *) exit 2 ;;
     esac
     ;;
@@ -148,6 +156,9 @@ case "$1" in
     ;;
   read)
     printf '%s\n' '{"contents":[{"uri":"doc://guide","text":"hello"}]}'
+    ;;
+  template-read)
+    printf '%s\n' '{"contents":[{"uri":"doc://guide/intro","text":"hello"}]}'
     ;;
   *) exit 2 ;;
 esac

@@ -13,7 +13,7 @@ import (
 	"github.com/patrickyoung/mcp/internal/mcpclient"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -37,6 +37,7 @@ func run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		fs := flag.NewFlagSet("make", flag.ContinueOnError)
 		fs.SetOutput(stderr)
 		mcpPath := fs.String("mcp", "", "path to the mcp filter")
+		headers := fs.String("headers", "", "HTTP header file used only during discovery")
 		if err := fs.Parse(argv[1:]); err != nil {
 			return 2
 		}
@@ -48,7 +49,7 @@ func run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, err)
 		}
-		if err := box.Make(ctx, rest[0], endpoint, box.Config{MCP: *mcpPath, Stderr: stderr}); err != nil {
+		if err := box.Make(ctx, rest[0], endpoint, box.Config{MCP: *mcpPath, Stderr: stderr, Headers: *headers}); err != nil {
 			return fail(stderr, err)
 		}
 		fmt.Fprintf(stderr, "mcpbox: wrote unadmitted capability folder %s\n", rest[0])
@@ -108,7 +109,7 @@ func fail(stderr io.Writer, err error) int {
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `usage:
-  mcpbox make [-mcp PATH] DIR -- SERVER [ARG ...]
+  mcpbox make [-mcp PATH] [-headers FILE] DIR -- SERVER [ARG ...]
   mcpbox show DIR
   mcpbox diff OLD NEW
   mcpbox tools|prompts|resources|templates DIR
@@ -117,6 +118,6 @@ func usage(w io.Writer) {
 
 make discovers into a new folder atomically and grants nothing. Listing a
 kind prints name, descriptor digest, and synopsis as TSV. admit is the only
-command that creates callable tool programs; changed descriptors stop at
-runtime before tools/call is sent.`)
+command that creates callable programs; changed descriptors stop at runtime
+before a capability request is sent.`)
 }

@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# mcpserve appends the MCP method to exact argv and supplies its params on
+# stdin. A real dispatcher would normally route to separate executables.
+case $1 in
+tools/call)
+	read -r params || params='{}'
+	printf '%s\n' '{"content":[{"type":"text","text":"hello from a Unix filter"}],"structuredContent":{"greeting":"hello from a Unix filter"}}'
+	;;
+*)
+	printf '%s\n' '{"code":-32601,"message":"method not implemented by this example"}'
+	exit 1
+	;;
+esac
