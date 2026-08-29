@@ -58,6 +58,16 @@ func TestMakeGrantsNothingUntilAdmit(t *testing.T) {
 	if info.Mode()&0o111 == 0 {
 		t.Fatalf("admitted tool is not executable: %v", info.Mode())
 	}
+	wrapper, err := os.ReadFile(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(wrapper, []byte("mcpbox")) {
+		t.Fatal("admitted tool retains a runtime dependency on mcpbox")
+	}
+	if !bytes.Contains(wrapper, []byte(fake)) {
+		t.Fatal("admitted tool does not invoke the configured mcp filter")
+	}
 	cmd := exec.Command(tool)
 	cmd.Stdin = strings.NewReader(`{"hello":"world"}`)
 	out, err := cmd.Output()
