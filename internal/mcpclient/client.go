@@ -1,0 +1,641 @@
+package mcpclient
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/patrickyoung/mcp/internal/admit"
+)
+
+const (
+	ProtocolVersion = "2026-07-28"
+	DefaultMaxInput = int64(16 << 20)
+	DefaultMaxWire  = int64(64 << 20)
+)
+
+type Endpoint = admit.Endpoint
+
+type Options struct {
+	Timeout   time.Duration
+	MaxInput  int64
+	MaxOutput int64
+	Stderr    io.Writer
+	Events    io.Writer
+	Listen    io.Writer
+}
+
+type Outcome struct {
+	Raw  json.RawMessage
+	Code int
+}
+
+type session struct {
+	client    *mcp.Client
+	conn      *mcp.ClientSession
+	recorder  *recorder
+	endpoint  Endpoint
+	discovery json.RawMessage
+}
+
+func ResolveEndpoint(argv []string) (Endpoint, error) {
+	if len(argv) == 0 {
+		return Endpoint{}, fmt.Errorf("missing server command")
+	}
+	command, err := exec.LookPath(argv[0])
+	if err != nil {
+		return Endpoint{}, fmt.Errorf("server command %q: %w", argv[0], err)
+	}
+	command, err = canonicalExecutable(command)
+	if err != nil {
+		return Endpoint{}, err
+	}
+	return Endpoint{Type: "stdio", Command: command, Args: append([]string(nil), argv[1:]...), Path: os.Getenv("PATH")}, nil
+}
+
+func ReadParams(r io.Reader, max int64) (json.RawMessage, error) {
+	if max <= 0 {
+		max = DefaultMaxInput
+	}
+	data, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("input exceeds %d bytes", max)
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return json.RawMessage("{}"), nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var value map[string]any
+	if err := dec.Decode(&value); err != nil {
+		return nil, fmt.Errorf("stdin must be one JSON object: %w", err)
+	}
+	if value == nil {
+		return nil, fmt.Errorf("stdin must be one JSON object")
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("stdin must contain exactly one JSON object")
+	}
+	return json.Marshal(value)
+}
+
+func Discover(ctx context.Context, endpoint Endpoint, opts Options) (Outcome, error) {
+	runCtx, cancel := withTimeout(ctx, opts.Timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+	s, err := connect(runCtx, endpoint, opts, false)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer s.conn.Close()
+	return Outcome{Raw: append(json.RawMessage(nil), s.discovery...), Code: 0}, nil
+}
+
+func Request(ctx context.Context, endpoint Endpoint, method string, params json.RawMessage, opts Options) (Outcome, error) {
+	if method == "" {
+		return Outcome{}, fmt.Errorf("missing method")
+	}
+	runCtx, cancel := withTimeout(ctx, opts.Timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+	s, err := connect(runCtx, endpoint, opts, false)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer s.conn.Close()
+	s.recorder.Begin(true)
+	err = callStandardOrCustom(runCtx, s.client, s.conn, method, params)
+	return finish(ctx, s.recorder, err)
+}
+
+// Tool verifies the server's current descriptor in the same connection and
+// only then performs the admitted call. Discovery and verification are not
+// counted as the tool effect; the tools/call write is the irreversible edge.
+func Tool(ctx context.Context, endpoint Endpoint, name, expected string, arguments json.RawMessage, opts Options) (Outcome, error) {
+	if name == "" || expected == "" {
+		return Outcome{}, fmt.Errorf("tool name and expected descriptor digest are required")
+	}
+	runCtx, cancel := withTimeout(ctx, opts.Timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+	s, err := connect(runCtx, endpoint, opts, false)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer s.conn.Close()
+
+	descriptor, err := findTool(runCtx, s, name)
+	if err != nil {
+		return Outcome{}, err
+	}
+	digest, err := admit.Digest("tools", endpoint, s.discovery, descriptor)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if digest != expected {
+		return Outcome{}, fmt.Errorf("tool %q descriptor changed: expected %s, got %s", name, expected, digest)
+	}
+
+	var args any
+	dec := json.NewDecoder(bytes.NewReader(arguments))
+	dec.UseNumber()
+	if err := dec.Decode(&args); err != nil {
+		return Outcome{}, fmt.Errorf("tool arguments: %w", err)
+	}
+	s.recorder.Begin(true)
+	_, err = s.conn.CallTool(runCtx, &mcp.CallToolParams{Name: name, Arguments: args})
+	return finish(ctx, s.recorder, err)
+}
+
+// Prompt verifies one admitted prompt descriptor, then retrieves the prompt.
+// The input object is the prompt's string-valued arguments map.
+func Prompt(ctx context.Context, endpoint Endpoint, name, expected string, arguments json.RawMessage, opts Options) (Outcome, error) {
+	if name == "" || expected == "" {
+		return Outcome{}, fmt.Errorf("prompt name and expected descriptor digest are required")
+	}
+	runCtx, cancel := withTimeout(ctx, opts.Timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+	s, err := connect(runCtx, endpoint, opts, false)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer s.conn.Close()
+	descriptor, err := findPrompt(runCtx, s, name)
+	if err != nil {
+		return Outcome{}, err
+	}
+	digest, err := admit.Digest("prompts", endpoint, s.discovery, descriptor)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if digest != expected {
+		return Outcome{}, fmt.Errorf("prompt %q descriptor changed: expected %s, got %s", name, expected, digest)
+	}
+	var args map[string]string
+	if err := json.Unmarshal(arguments, &args); err != nil {
+		return Outcome{}, fmt.Errorf("prompt arguments must be a JSON object of strings: %w", err)
+	}
+	s.recorder.Begin(true)
+	_, err = s.conn.GetPrompt(runCtx, &mcp.GetPromptParams{Name: name, Arguments: args})
+	return finish(ctx, s.recorder, err)
+}
+
+// ReadResource verifies one admitted resource descriptor, then reads its URI.
+func ReadResource(ctx context.Context, endpoint Endpoint, uri, expected string, opts Options) (Outcome, error) {
+	if uri == "" || expected == "" {
+		return Outcome{}, fmt.Errorf("resource URI and expected descriptor digest are required")
+	}
+	runCtx, cancel := withTimeout(ctx, opts.Timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+	s, err := connect(runCtx, endpoint, opts, false)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer s.conn.Close()
+	descriptor, err := findResource(runCtx, s, uri)
+	if err != nil {
+		return Outcome{}, err
+	}
+	digest, err := admit.Digest("resources", endpoint, s.discovery, descriptor)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if digest != expected {
+		return Outcome{}, fmt.Errorf("resource %q descriptor changed: expected %s, got %s", uri, expected, digest)
+	}
+	s.recorder.Begin(true)
+	_, err = s.conn.ReadResource(runCtx, &mcp.ReadResourceParams{URI: uri})
+	return finish(ctx, s.recorder, err)
+}
+
+func connect(parent context.Context, endpoint Endpoint, opts Options, listening bool) (*session, error) {
+	ctx := parent
+	if endpoint.Type != "stdio" || endpoint.Command == "" {
+		return nil, fmt.Errorf("only an explicit stdio endpoint is supported")
+	}
+	stderr := opts.Stderr
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	maxOutput := opts.MaxOutput
+	if maxOutput <= 0 {
+		maxOutput = DefaultMaxWire
+	}
+	base := &commandTransport{endpoint: endpoint, stderr: stderr, maxOutput: maxOutput, grace: time.Second}
+	rec := new(recorder)
+
+	events := &jsonlWriter{w: opts.Events}
+	listen := &jsonlWriter{w: opts.Listen}
+	clientOpts := &mcp.ClientOptions{
+		Capabilities:   &mcp.ClientCapabilities{},
+		MultiRoundTrip: &mcp.MultiRoundTripOptions{Disabled: true},
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			events.write("notifications/progress", req.Params)
+		},
+	}
+	if listening {
+		clientOpts.ToolListChangedHandler = func(_ context.Context, req *mcp.ToolListChangedRequest) {
+			listen.write("notifications/tools/list_changed", req.Params)
+		}
+		clientOpts.PromptListChangedHandler = func(_ context.Context, req *mcp.PromptListChangedRequest) {
+			listen.write("notifications/prompts/list_changed", req.Params)
+		}
+		clientOpts.ResourceListChangedHandler = func(_ context.Context, req *mcp.ResourceListChangedRequest) {
+			listen.write("notifications/resources/list_changed", req.Params)
+		}
+		clientOpts.ResourceUpdatedHandler = func(_ context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
+			listen.write("notifications/resources/updated", req.Params)
+		}
+	}
+	c := mcp.NewClient(&mcp.Implementation{Name: "unix-mcp", Version: "0.1.0"}, clientOpts)
+	cs, err := c.Connect(ctx, rec.transport(base), nil)
+	if err != nil {
+		return nil, classifyBeforeEffect(parent, err)
+	}
+	init := cs.InitializeResult()
+	if init == nil || init.ProtocolVersion != ProtocolVersion {
+		_ = cs.Close()
+		version := "unknown"
+		if init != nil {
+			version = init.ProtocolVersion
+		}
+		return nil, fmt.Errorf("server negotiated %s; modern stateless MCP %s is required", version, ProtocolVersion)
+	}
+	response, ok := rec.Last("server/discover")
+	if !ok || len(response.Result) == 0 || len(response.Error) != 0 {
+		_ = cs.Close()
+		return nil, fmt.Errorf("server/discover produced no trustworthy result")
+	}
+	return &session{client: c, conn: cs, recorder: rec, endpoint: endpoint, discovery: response.Result}, nil
+}
+
+func Listen(ctx context.Context, endpoint Endpoint, opts Options) error {
+	runCtx, cancel := withTimeout(ctx, opts.Timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+	s, err := connect(runCtx, endpoint, opts, true)
+	if err != nil {
+		return err
+	}
+	defer s.conn.Close()
+	done := make(chan error, 1)
+	go func() { done <- s.conn.Wait() }()
+	select {
+	case <-runCtx.Done():
+		return runCtx.Err()
+	case err := <-done:
+		if err == nil {
+			return io.ErrUnexpectedEOF
+		}
+		return err
+	}
+}
+
+func findTool(ctx context.Context, s *session, name string) (json.RawMessage, error) {
+	cursor := ""
+	for {
+		s.recorder.Begin(false)
+		_, err := s.conn.ListTools(ctx, &mcp.ListToolsParams{Cursor: cursor})
+		outcome, finishErr := finish(ctx, s.recorder, err)
+		if finishErr != nil {
+			return nil, finishErr
+		}
+		if outcome.Code != 0 {
+			return nil, fmt.Errorf("listing tools returned exit %d", outcome.Code)
+		}
+		var page struct {
+			Tools      []json.RawMessage `json:"tools"`
+			NextCursor string            `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(outcome.Raw, &page); err != nil {
+			return nil, fmt.Errorf("tools/list result: %w", err)
+		}
+		for _, raw := range page.Tools {
+			var head struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(raw, &head) == nil && head.Name == name {
+				return raw, nil
+			}
+		}
+		if page.NextCursor == "" {
+			return nil, fmt.Errorf("tool %q is no longer advertised", name)
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func findPrompt(ctx context.Context, s *session, name string) (json.RawMessage, error) {
+	cursor := ""
+	for {
+		s.recorder.Begin(false)
+		_, err := s.conn.ListPrompts(ctx, &mcp.ListPromptsParams{Cursor: cursor})
+		outcome, finishErr := finish(ctx, s.recorder, err)
+		if finishErr != nil {
+			return nil, finishErr
+		}
+		var page struct {
+			Prompts    []json.RawMessage `json:"prompts"`
+			NextCursor string            `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(outcome.Raw, &page); err != nil {
+			return nil, fmt.Errorf("prompts/list result: %w", err)
+		}
+		for _, raw := range page.Prompts {
+			var head struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(raw, &head) == nil && head.Name == name {
+				return raw, nil
+			}
+		}
+		if page.NextCursor == "" {
+			return nil, fmt.Errorf("prompt %q is no longer advertised", name)
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func findResource(ctx context.Context, s *session, uri string) (json.RawMessage, error) {
+	cursor := ""
+	for {
+		s.recorder.Begin(false)
+		_, err := s.conn.ListResources(ctx, &mcp.ListResourcesParams{Cursor: cursor})
+		outcome, finishErr := finish(ctx, s.recorder, err)
+		if finishErr != nil {
+			return nil, finishErr
+		}
+		var page struct {
+			Resources  []json.RawMessage `json:"resources"`
+			NextCursor string            `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(outcome.Raw, &page); err != nil {
+			return nil, fmt.Errorf("resources/list result: %w", err)
+		}
+		for _, raw := range page.Resources {
+			var head struct {
+				URI string `json:"uri"`
+			}
+			if json.Unmarshal(raw, &head) == nil && head.URI == uri {
+				return raw, nil
+			}
+		}
+		if page.NextCursor == "" {
+			return nil, fmt.Errorf("resource %q is no longer advertised", uri)
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func finish(parent context.Context, rec *recorder, callErr error) (Outcome, error) {
+	response, ready := rec.Target()
+	if callErr != nil {
+		if ready && len(response.Error) != 0 {
+			if rec.DuplicateWithin(2 * time.Millisecond) {
+				return Outcome{}, &ExitError{Code: 125, Err: fmt.Errorf("duplicate terminal response")}
+			}
+			return Outcome{Raw: response.Error, Code: 1}, nil
+		}
+		if rec.Sent() {
+			return Outcome{}, &ExitError{Code: 125, Err: callErr}
+		}
+		if errors.Is(parent.Err(), context.Canceled) {
+			return Outcome{}, &ExitError{Code: 130, Err: parent.Err()}
+		}
+		return Outcome{}, callErr
+	}
+	if !ready || len(response.Result) == 0 {
+		code := 2
+		if rec.Sent() {
+			code = 125
+		}
+		return Outcome{}, &ExitError{Code: code, Err: fmt.Errorf("no trustworthy terminal response")}
+	}
+	if rec.DuplicateWithin(2 * time.Millisecond) {
+		return Outcome{}, &ExitError{Code: 125, Err: fmt.Errorf("duplicate terminal response")}
+	}
+	return Outcome{Raw: response.Result, Code: resultCode(response.Result)}, nil
+}
+
+func resultCode(raw []byte) int {
+	var result struct {
+		IsError    bool   `json:"isError"`
+		ResultType string `json:"resultType"`
+		Status     string `json:"status"`
+	}
+	if json.Unmarshal(raw, &result) != nil {
+		return 0
+	}
+	if result.IsError {
+		return 1
+	}
+	if result.ResultType == "input_required" || result.Status == "working" || result.Status == "input_required" {
+		return 75
+	}
+	if result.Status == "failed" || result.Status == "cancelled" {
+		return 1
+	}
+	return 0
+}
+
+type ExitError struct {
+	Code int
+	Err  error
+}
+
+func (e *ExitError) Error() string { return e.Err.Error() }
+func (e *ExitError) Unwrap() error { return e.Err }
+
+func callStandardOrCustom(ctx context.Context, c *mcp.Client, cs *mcp.ClientSession, method string, raw json.RawMessage) error {
+	switch method {
+	case "ping":
+		var p mcp.PingParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		return cs.Ping(ctx, &p)
+	case "tools/list":
+		var p mcp.ListToolsParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		_, err := cs.ListTools(ctx, &p)
+		return err
+	case "tools/call":
+		var p mcp.CallToolParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		_, err := cs.CallTool(ctx, &p)
+		return err
+	case "prompts/list":
+		var p mcp.ListPromptsParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		_, err := cs.ListPrompts(ctx, &p)
+		return err
+	case "prompts/get":
+		var p mcp.GetPromptParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		_, err := cs.GetPrompt(ctx, &p)
+		return err
+	case "resources/list":
+		var p mcp.ListResourcesParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		_, err := cs.ListResources(ctx, &p)
+		return err
+	case "resources/templates/list":
+		var p mcp.ListResourceTemplatesParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		_, err := cs.ListResourceTemplates(ctx, &p)
+		return err
+	case "resources/read":
+		var p mcp.ReadResourceParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		_, err := cs.ReadResource(ctx, &p)
+		return err
+	case "completion/complete":
+		var p mcp.CompleteParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		_, err := cs.Complete(ctx, &p)
+		return err
+	case "logging/setLevel":
+		var p mcp.SetLoggingLevelParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		return cs.SetLoggingLevel(ctx, &p)
+	case "server/discover", "initialize":
+		return fmt.Errorf("%s is lifecycle machinery; use mcp discover", method)
+	}
+
+	p := &rawParams{raw: append(json.RawMessage(nil), raw...)}
+	if err := mcp.AddSendingCustomMethod[*rawParams, *rawResult](c, method); err != nil {
+		return err
+	}
+	_, err := mcp.CallCustomMethod[*rawParams, *rawResult](ctx, cs, method, p)
+	return err
+}
+
+type rawParams struct {
+	mcp.ParamsBase
+	raw json.RawMessage
+}
+
+func (p *rawParams) MarshalJSON() ([]byte, error) {
+	var body map[string]any
+	dec := json.NewDecoder(bytes.NewReader(p.raw))
+	dec.UseNumber()
+	if err := dec.Decode(&body); err != nil {
+		return nil, err
+	}
+	if p.Meta != nil {
+		body["_meta"] = p.Meta
+	}
+	return json.Marshal(body)
+}
+
+type rawResult struct {
+	mcp.ResultBase
+	raw json.RawMessage
+}
+
+func (r *rawResult) UnmarshalJSON(data []byte) error {
+	r.raw = append(r.raw[:0], data...)
+	var body struct {
+		Meta mcp.Meta `json:"_meta"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		return err
+	}
+	r.Meta = body.Meta
+	return nil
+}
+
+func withTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return parent, nil
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func classifyBeforeEffect(parent context.Context, err error) error {
+	if errors.Is(parent.Err(), context.Canceled) {
+		return &ExitError{Code: 130, Err: err}
+	}
+	return err
+}
+
+func canonicalExecutable(path string) (string, error) {
+	resolved, err := exec.LookPath(path)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(resolved, "/") {
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return "", err
+		}
+	}
+	if final, err := filepath.EvalSymlinks(resolved); err == nil {
+		resolved = final
+	}
+	return filepath.Clean(resolved), nil
+}
+
+type jsonlWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (w *jsonlWriter) write(method string, params any) {
+	if w.w == nil {
+		return
+	}
+	record := struct {
+		Method string `json:"method"`
+		Params any    `json:"params,omitempty"`
+	}{method, params}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, _ = w.w.Write(append(raw, '\n'))
+}

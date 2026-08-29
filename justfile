@@ -1,0 +1,10 @@
+default:
+    go test ./...
+
+race:
+    go test -race ./...
+
+build:
+    mkdir -p bin
+    go build -o bin/mcp ./cmd/mcp
+    go build -o bin/mcpbox ./cmd/mcpbox
