@@ -22,14 +22,15 @@ go install ./cmd/mcp ./cmd/mcpbox
 ## One request
 
 The server command always follows `--`, so it remains exact argv rather than
-shell text:
+shell text. From this checkout, the included official-SDK server makes a
+complete local smoke test:
 
 ```sh
-mcp discover -- npx -y @modelcontextprotocol/server-everything
-
-printf '%s\n' '{"name":"echo","arguments":{"message":"hello"}}' |
-  mcp request tools/call -- npx -y @modelcontextprotocol/server-everything
+printf '%s\n' '{"name":"hello","arguments":{"name":"Unix"}}' |
+  mcp request tools/call -- go run ./examples/hello-server
 ```
+
+Use `mcp discover -- SERVER [ARG ...]` to inspect any other modern server.
 
 stdin is empty or one bounded JSON object. stdout is the exact MCP result.
 The server's stderr remains stderr. `-event-fd 3` writes progress JSONL to an
@@ -63,18 +64,17 @@ or a model on the server's behalf.
 Discovery grants nothing:
 
 ```sh
-mcpbox make github.mcp -- npx -y @modelcontextprotocol/server-github
-mcpbox show github.mcp
-mcpbox tools github.mcp
+mcpbox make hello.mcp -- go run ./examples/hello-server
+mcpbox show hello.mcp
+mcpbox tools hello.mcp
 ```
 
 `mcpbox tools` prints a TSV catalogue containing the tool name, its descriptor
 digest, and its synopsis. Admission is a separate literal action:
 
 ```sh
-mcpbox admit github.mcp tools search_repositories get_file_contents
-PATH="$PWD/github.mcp/tools" ply -t "$PWD/github.mcp/tools" \
-  'find the repository and read its README'
+mcpbox admit hello.mcp tools hello
+printf '%s\n' '{"name":"Pike"}' | hello.mcp/tools/hello
 ```
 
 An admitted tool wrapper pins the endpoint, tool name, and reviewed digest.
@@ -85,13 +85,13 @@ call.
 Prompts and resources retain MCP's different control model:
 
 ```sh
-mcpbox prompts github.mcp
-mcpbox admit github.mcp prompts review-pr
-printf '%s\n' '{"tone":"brief"}' | github.mcp/prompts/review-pr
+mcpbox prompts server.mcp
+mcpbox admit server.mcp prompts review-pr
+printf '%s\n' '{"tone":"brief"}' | server.mcp/prompts/review-pr
 
-mcpbox resources github.mcp
-mcpbox admit github.mcp resources 'repo://README.md'
-github.mcp/bin/read 'repo://README.md'
+mcpbox resources server.mcp
+mcpbox admit server.mcp resources 'repo://README.md'
+server.mcp/bin/read 'repo://README.md'
 ```
 
 The generated resource reader accepts only exact admitted URIs. Resource
@@ -100,8 +100,8 @@ templates are catalogued but are not automatically expanded or admitted.
 Refresh into a new folder and use the ordinary system diff:
 
 ```sh
-mcpbox make github.next.mcp -- npx -y @modelcontextprotocol/server-github
-mcpbox diff github.mcp github.next.mcp
+mcpbox make server.next.mcp -- SERVER [ARG ...]
+mcpbox diff server.mcp server.next.mcp
 ```
 
 Generation uses a private staging directory and one final rename. A failed or

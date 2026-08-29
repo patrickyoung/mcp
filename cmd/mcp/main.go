@@ -40,7 +40,7 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 		if err != nil {
 			return diagnose(stderr, err)
 		}
-		server, err := afterSeparator(rest)
+		server, err := afterFlagSeparator(rest)
 		if err != nil {
 			return diagnose(stderr, err)
 		}
@@ -84,7 +84,7 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 		if err != nil {
 			return diagnose(stderr, err)
 		}
-		server, err := afterSeparator(rest)
+		server, err := afterFlagSeparator(rest)
 		if err != nil {
 			return diagnose(stderr, err)
 		}
@@ -234,6 +234,16 @@ func afterSeparator(args []string) ([]string, error) {
 		return nil, fmt.Errorf("expected -- SERVER [ARG ...]")
 	}
 	return args[1:], nil
+}
+
+// flag.FlagSet consumes a leading -- when it parses all options before the
+// server argv, as discover and listen do. Commands with a METHOD/NAME before
+// the separator use afterSeparator instead because parsing stops at that word.
+func afterFlagSeparator(args []string) ([]string, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("expected -- SERVER [ARG ...]")
+	}
+	return args, nil
 }
 
 func emit(stdout, stderr io.Writer, outcome mcpclient.Outcome, err error) int {
