@@ -13,7 +13,7 @@ import (
 	"github.com/patrickyoung/mcp/internal/mcpserve"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -25,7 +25,7 @@ func run(ctx context.Context, argv []string) int {
 	if len(argv) == 1 {
 		switch argv[0] {
 		case "version", "--version":
-			fmt.Fprintln(os.Stdout, version)
+			fmt.Fprintln(os.Stdout, "mcpserve "+version)
 			return 0
 		case "help", "-h", "--help":
 			usage()

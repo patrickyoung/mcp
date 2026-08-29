@@ -16,7 +16,7 @@ import (
 	"github.com/patrickyoung/mcp/internal/mcpclient"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -34,7 +34,7 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 		usage(stdout)
 		return 0
 	case "version", "--version":
-		fmt.Fprintln(stdout, version)
+		fmt.Fprintln(stdout, "mcp "+version)
 		return 0
 	case "discover":
 		cfg, rest, err := parseCommon("discover", argv[1:], stderr)

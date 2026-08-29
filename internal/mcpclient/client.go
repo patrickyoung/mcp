@@ -335,7 +335,7 @@ func connect(parent context.Context, endpoint Endpoint, opts Options, listening 
 			listen.write("notifications/message", req.Params)
 		}
 	}
-	c := mcp.NewClient(&mcp.Implementation{Name: "unix-mcp", Version: "0.2.0"}, clientOpts)
+	c := mcp.NewClient(&mcp.Implementation{Name: "unix-mcp", Version: "0.2.1"}, clientOpts)
 	cs, err := c.Connect(ctx, rec.transport(base), nil)
 	if err != nil {
 		return nil, classifyBeforeEffect(parent, err)

@@ -13,7 +13,7 @@ import (
 	"github.com/patrickyoung/mcp/internal/mcpclient"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -31,7 +31,7 @@ func run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		usage(stdout)
 		return 0
 	case "version", "--version":
-		fmt.Fprintln(stdout, version)
+		fmt.Fprintln(stdout, "mcpbox "+version)
 		return 0
 	case "make":
 		fs := flag.NewFlagSet("make", flag.ContinueOnError)
