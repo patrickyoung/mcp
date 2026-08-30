@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/patrickyoung/mcp/internal/mcpcli"
+	"github.com/patrickyoung/mcp/internal/mcpclient"
 )
 
 const version = "0.2.1"
@@ -19,5 +20,9 @@ func main() {
 }
 
 func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	return mcpcli.Run(ctx, mcpcli.Program{Name: "mcp", Version: version, Listen: true}, argv, stdin, stdout, stderr)
+	return mcpcli.Run(ctx, mcpcli.Program{
+		Name:      "mcp-legacy",
+		Version:   version,
+		Lifecycle: mcpclient.LegacyLifecycle,
+	}, argv, stdin, stdout, stderr)
 }

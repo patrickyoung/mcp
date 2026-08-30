@@ -7,7 +7,7 @@ usage() {
 	cat <<'EOF'
 usage: ./install.sh [-prefix DIR]
 
-Build mcp, mcpbox, and mcpserve from this checkout and install them under DIR/bin.
+Build mcp, mcp-legacy, mcpbox, and mcpserve from this checkout and install them under DIR/bin.
 The default prefix is $HOME/.local.
 EOF
 }
@@ -42,12 +42,14 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 (cd "$here" && go test ./...)
 (cd "$here" && go build -trimpath -o "$tmp/mcp" ./cmd/mcp)
+(cd "$here" && go build -trimpath -o "$tmp/mcp-legacy" ./cmd/mcp-legacy)
 (cd "$here" && go build -trimpath -o "$tmp/mcpbox" ./cmd/mcpbox)
 (cd "$here" && go build -trimpath -o "$tmp/mcpserve" ./cmd/mcpserve)
 
 mkdir -p "$prefix/bin"
 install -m 0755 "$tmp/mcp" "$prefix/bin/mcp"
+install -m 0755 "$tmp/mcp-legacy" "$prefix/bin/mcp-legacy"
 install -m 0755 "$tmp/mcpbox" "$prefix/bin/mcpbox"
 install -m 0755 "$tmp/mcpserve" "$prefix/bin/mcpserve"
 
-echo "installed mcp, mcpbox, and mcpserve in $prefix/bin" >&2
+echo "installed mcp, mcp-legacy, mcpbox, and mcpserve in $prefix/bin" >&2

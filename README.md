@@ -5,12 +5,15 @@ MCP at the edge; ordinary Unix inside.
 This repository now works in both directions:
 
 - `mcp` turns one MCP request into a Unix filter invocation.
+- `mcp-legacy` does the same through an explicit pre-2026 compatibility path.
 - `mcpbox` compiles discovery into an explicitly admitted capability folder.
 - `mcpserve` turns ordinary Unix filters into a modern MCP server.
 
-It implements the current stateless MCP `2026-07-28` wire protocol through the
-official Go SDK. It is not an agent framework, hosted platform, application
-SDK, model host, daemon, workflow engine, or credential store.
+`mcp` implements the current stateless MCP `2026-07-28` wire protocol through
+the official Go SDK. `mcp-legacy` uses that SDK's stateful lifecycle for
+`2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05`. Neither program is
+an agent framework, hosted platform, application SDK, model host, daemon,
+workflow engine, or credential store.
 
 ## Install
 
@@ -20,8 +23,9 @@ Requires Go 1.26 or newer.
 ./install.sh
 ```
 
-This installs `mcp`, `mcpbox`, and `mcpserve` under `$HOME/.local/bin` by
-default. Use `./install.sh -prefix DIR` to choose another prefix.
+This installs `mcp`, `mcp-legacy`, `mcpbox`, and `mcpserve` under
+`$HOME/.local/bin` by default. Use `./install.sh -prefix DIR` to choose another
+prefix.
 
 ## Consume MCP as a filter
 
@@ -92,6 +96,40 @@ An `input_required` result is printed intact and exits 75. The caller retains
 the opaque `requestState`, obtains the requested input through Ask, May, or any
 other ordinary program, then issues a new request with `inputResponses`.
 `mcp` never invokes a user, model, or approval system behind the caller's back.
+
+## Use a legacy server explicitly
+
+Legacy negotiation is never an implicit fallback in `mcp`. Select the
+compatibility executable at the process boundary instead:
+
+```sh
+mcp-legacy discover -- \
+  uvx --from git+https://github.com/Rudra-ravi/wikipedia-mcp wikipedia-mcp
+
+printf '%s\n' '{"name":"search_wikipedia","arguments":{"query":"Unix"}}' |
+  mcp-legacy request tools/call -- \
+  uvx --from git+https://github.com/Rudra-ravi/wikipedia-mcp wikipedia-mcp
+```
+
+`mcp-legacy` forces the official SDK's `initialize`/`initialized` lifecycle and
+prints the exact initialize result from `discover`. It otherwise keeps the
+same one-request, bounded-I/O, no-retry, and exit-status contract as `mcp`.
+It supports stdio and Streamable HTTP where the negotiated revision defines
+them; it does not implement the deprecated HTTP+SSE transport or the modern
+`subscriptions/listen` method.
+
+Capability folders compose by selecting the compatibility executable once:
+
+```sh
+mcpbox make -mcp "$(command -v mcp-legacy)" wikipedia.mcp -- \
+  uvx --from git+https://github.com/Rudra-ravi/wikipedia-mcp wikipedia-mcp
+mcpbox tools wikipedia.mcp
+mcpbox admit wikipedia.mcp tools search_wikipedia
+printf '%s\n' '{"query":"Unix"}' | wikipedia.mcp/tools/search_wikipedia
+```
+
+The generated wrappers retain that exact `mcp-legacy` path and perform the
+same descriptor check immediately before each admitted operation.
 
 ## Observe subscriptions
 

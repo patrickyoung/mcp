@@ -49,6 +49,55 @@ func TestRequestPreservesResultAndClassifiesOutcomes(t *testing.T) {
 	}
 }
 
+func TestLegacyLifecycleUsesInitializeAndPreservesItsResult(t *testing.T) {
+	endpoint := helperEndpoint(t, "legacy")
+	s, err := connect(context.Background(), endpoint, Options{Lifecycle: LegacyLifecycle}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.conn.Close()
+	if _, ok := s.recorder.Last("server/discover"); ok {
+		t.Fatal("legacy mode sent server/discover to the server")
+	}
+	if _, ok := s.recorder.Last("initialize"); !ok {
+		t.Fatal("legacy mode did not send initialize")
+	}
+	if !strings.Contains(string(s.discovery), `"protocolVersion":"2025-11-25"`) ||
+		!strings.Contains(string(s.discovery), `"serverInfo":{"name":"legacy-test"`) {
+		t.Fatalf("discovery = %s", s.discovery)
+	}
+
+	out, err := Request(context.Background(), endpoint, "tools/list", json.RawMessage(`{}`), Options{Lifecycle: LegacyLifecycle})
+	if err != nil || out.Code != 0 || !strings.Contains(string(out.Raw), `"name":"echo"`) {
+		t.Fatalf("legacy request = %#v, %v", out, err)
+	}
+}
+
+func TestLegacyLifecycleAcceptsEverySDKLegacyRevision(t *testing.T) {
+	for version := range legacyProtocolVersions {
+		t.Run(version, func(t *testing.T) {
+			out, err := Discover(context.Background(), helperEndpoint(t, "legacy-version-"+version), Options{Lifecycle: LegacyLifecycle})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(out.Raw), `"protocolVersion":"`+version+`"`) {
+				t.Fatalf("discovery = %s", out.Raw)
+			}
+		})
+	}
+	_, err := Discover(context.Background(), helperEndpoint(t, "legacy-version-"+ProtocolVersion), Options{Lifecycle: LegacyLifecycle})
+	if err == nil || !strings.Contains(err.Error(), "a supported legacy MCP version is required") {
+		t.Fatalf("modern version in legacy mode: %v", err)
+	}
+}
+
+func TestModernLifecycleRejectsLegacyNegotiation(t *testing.T) {
+	_, err := Discover(context.Background(), helperEndpoint(t, "legacy-only"), Options{})
+	if err == nil || !strings.Contains(err.Error(), "modern stateless MCP 2026-07-28 is required") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestPostSendFailuresAreUnknown(t *testing.T) {
 	for _, mode := range []string{"drop", "wrong-id", "malformed", "duplicate"} {
 		t.Run(mode, func(t *testing.T) {
@@ -378,6 +427,10 @@ func serveHelper(mode string, extra []string) {
 		}
 		switch req.Method {
 		case "server/discover":
+			if mode == "legacy-only" {
+				writeError(enc, req.ID, -32601, "method not found")
+				continue
+			}
 			writeResponse(enc, req.ID, map[string]any{
 				"resultType":        "complete",
 				"_meta":             map[string]any{"io.modelcontextprotocol/serverInfo": map[string]any{"name": "test-server", "version": "1"}},
@@ -388,6 +441,18 @@ func serveHelper(mode string, extra []string) {
 					"tools": map[string]any{}, "prompts": map[string]any{}, "resources": map[string]any{},
 				},
 			})
+		case "initialize":
+			version := "2025-11-25"
+			if strings.HasPrefix(mode, "legacy-version-") {
+				version = strings.TrimPrefix(mode, "legacy-version-")
+			}
+			writeResponse(enc, req.ID, map[string]any{
+				"protocolVersion": version,
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]any{"name": "legacy-test", "version": "1"},
+			})
+		case "notifications/initialized":
+			// Legacy lifecycle notification; no response is permitted.
 		case "tools/list":
 			writeResponse(enc, req.ID, map[string]any{
 				"resultType": "complete",

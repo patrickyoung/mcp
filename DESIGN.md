@@ -5,6 +5,9 @@
 `mcp` sends one self-contained MCP request to one explicit server and prints
 the exact result.
 
+`mcp-legacy` exposes the same filter contract behind an explicit legacy
+session lifecycle; it is never selected by fallback from `mcp`.
+
 `mcpbox` compiles one server's discovery result into a folder whose executable
 entries are the exact capabilities an operator admitted.
 
@@ -23,6 +26,7 @@ The protocol implementation comes from
 `github.com/modelcontextprotocol/go-sdk`. This repository adds:
 
 - exact stdio argv, stateless Streamable HTTP, and process-group lifetime;
+- an explicit legacy initialization mode isolated in a companion executable;
 - bounded JSON stdin and bounded server output;
 - result-byte capture before typed SDK decoding can discard unknown fields;
 - an irreversible sent boundary and exit 125 after uncertain effects;
@@ -92,6 +96,14 @@ server process.
 
 ## MCP surfaces
 
+The modern and legacy executables share request dispatch, exact result capture,
+effect classification, and admission verification. Their lifecycle policy is
+the deliberate seam: `mcp` requires `2026-07-28` discovery, while
+`mcp-legacy` forces the SDK-owned `initialize` path and accepts the SDK's four
+pre-2026 revisions. Its exact initialize result supplies capabilities and
+server identity to the existing digest model. Deprecated HTTP+SSE and legacy
+long-lived notification subscriptions are outside this one-request adapter.
+
 - Tools have generated, digest-checked executable wrappers.
 - Prompts have separate operator-invoked, digest-checked filters.
 - Exact resources use a generated allowlisting reader.
@@ -156,7 +168,5 @@ is composed with an operator-owned reverse proxy or explicit header producer.
 ## Next slices
 
 1. Add `mcp-unpack` for digest-named materialization of binary content.
-2. Add an explicit legacy compatibility process if a real deployment requires
-   pre-2026 stateful sessions.
-3. Add an optional Registry search filter that writes endpoint proposals and
+2. Add an optional Registry search filter that writes endpoint proposals and
    never installs or executes them.

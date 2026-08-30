@@ -7,10 +7,11 @@ resource, or resource-template request. Template admission authorizes the
 reviewed template; a concrete URI must match it before a read is sent.
 
 Do not place credentials in server argv. For HTTP, open an operator-owned
-header file on `mcp -header-fd`, or point an admitted wrapper at one with
-`MCP_HEADERS`. Capability folders intentionally contain no credential. They do
-contain endpoint identity, discovery data, schemas, descriptions, and the
-server runtime `PATH`; inspect them before sharing.
+header file on `mcp -header-fd` or `mcp-legacy -header-fd`, or point an
+admitted wrapper at one with `MCP_HEADERS`. Capability folders intentionally
+contain no credential. They do contain endpoint identity, discovery data,
+schemas, descriptions, and the server runtime `PATH`; inspect them before
+sharing.
 
 `mcpserve -http` is a protocol listener, not an identity provider or TLS
 terminator. Bind it locally or place it behind an operator-owned reverse proxy
@@ -25,6 +26,11 @@ authority.
 Resource URIs remain data and are never treated as local filesystem paths.
 This release does not fetch icons, remote assets, or MCP App resources except
 through an explicit admitted MCP request.
+
+Legacy support is an explicit executable choice. `mcp` never downgrades into a
+stateful session, and `mcp-legacy` never probes a server with modern discovery.
+The compatibility process still creates a fresh connection per invocation,
+never reconnects or retries, and records the effect boundary identically.
 
 An `mcpserve` dispatcher is executable authority. It receives untrusted MCP
 parameters and may inherit the service account's environment and filesystem.

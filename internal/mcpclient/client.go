@@ -28,9 +28,26 @@ const (
 	DefaultMaxWire  = int64(64 << 20)
 )
 
+// Lifecycle selects the MCP session establishment contract. ModernLifecycle
+// is deliberately the zero value so existing callers remain strict-modern.
+type Lifecycle uint8
+
+const (
+	ModernLifecycle Lifecycle = iota
+	LegacyLifecycle
+)
+
+var legacyProtocolVersions = map[string]struct{}{
+	"2025-11-25": {},
+	"2025-06-18": {},
+	"2025-03-26": {},
+	"2024-11-05": {},
+}
+
 type Endpoint = admit.Endpoint
 
 type Options struct {
+	Lifecycle     Lifecycle
 	Timeout       time.Duration
 	MaxInput      int64
 	MaxOutput     int64
@@ -282,6 +299,9 @@ func ReadTemplateResource(ctx context.Context, endpoint Endpoint, template, uri,
 }
 
 func connect(parent context.Context, endpoint Endpoint, opts Options, listening bool) (*session, error) {
+	if opts.Lifecycle != ModernLifecycle && opts.Lifecycle != LegacyLifecycle {
+		return nil, fmt.Errorf("unknown MCP lifecycle mode %d", opts.Lifecycle)
+	}
 	ctx := parent
 	stderr := opts.Stderr
 	if stderr == nil {
@@ -303,7 +323,7 @@ func connect(parent context.Context, endpoint Endpoint, opts Options, listening 
 	if listening {
 		rec.extensionNotifications = listen
 	}
-	capabilities, err := clientCapabilities(opts.Capabilities)
+	capabilities, err := clientCapabilities(opts.Capabilities, opts.Lifecycle)
 	if err != nil {
 		return nil, err
 	}
@@ -335,12 +355,38 @@ func connect(parent context.Context, endpoint Endpoint, opts Options, listening 
 			listen.write("notifications/message", req.Params)
 		}
 	}
-	c := mcp.NewClient(&mcp.Implementation{Name: "unix-mcp", Version: "0.2.1"}, clientOpts)
-	cs, err := c.Connect(ctx, rec.transport(base), nil)
+	clientName := "unix-mcp"
+	if opts.Lifecycle == LegacyLifecycle {
+		clientName = "unix-mcp-legacy"
+	}
+	c := mcp.NewClient(&mcp.Implementation{Name: clientName, Version: "0.2.1"}, clientOpts)
+	transport := rec.transport(base)
+	if opts.Lifecycle == LegacyLifecycle {
+		transport = forceLegacyTransport(transport)
+	} else {
+		transport = requireModernTransport(transport)
+	}
+	cs, err := c.Connect(ctx, transport, nil)
 	if err != nil {
 		return nil, classifyBeforeEffect(parent, err)
 	}
 	init := cs.InitializeResult()
+	if opts.Lifecycle == LegacyLifecycle {
+		if init == nil {
+			_ = cs.Close()
+			return nil, fmt.Errorf("legacy initialize produced no negotiated protocol version")
+		}
+		if _, ok := legacyProtocolVersions[init.ProtocolVersion]; !ok {
+			_ = cs.Close()
+			return nil, fmt.Errorf("server negotiated %s; a supported legacy MCP version is required", init.ProtocolVersion)
+		}
+		response, ok := rec.Last("initialize")
+		if !ok || len(response.Result) == 0 || len(response.Error) != 0 {
+			_ = cs.Close()
+			return nil, fmt.Errorf("initialize produced no trustworthy result")
+		}
+		return &session{client: c, conn: cs, recorder: rec, endpoint: endpoint, discovery: response.Result}, nil
+	}
 	if init == nil || init.ProtocolVersion != ProtocolVersion {
 		_ = cs.Close()
 		version := "unknown"
@@ -358,6 +404,9 @@ func connect(parent context.Context, endpoint Endpoint, opts Options, listening 
 }
 
 func Listen(ctx context.Context, endpoint Endpoint, opts Options) error {
+	if opts.Lifecycle == LegacyLifecycle {
+		return fmt.Errorf("listen is unavailable in legacy compatibility mode")
+	}
 	runCtx, cancel := withTimeout(ctx, opts.Timeout)
 	if cancel != nil {
 		defer cancel()
@@ -384,12 +433,14 @@ func Listen(ctx context.Context, endpoint Endpoint, opts Options) error {
 	}
 }
 
-func clientCapabilities(extra map[string]any) (*mcp.ClientCapabilities, error) {
+func clientCapabilities(extra map[string]any, lifecycle Lifecycle) (*mcp.ClientCapabilities, error) {
 	// A Unix caller can preserve task handles, inspect polymorphic results, and
-	// issue every task lifecycle request, so task support is truthful by
-	// default. Other extensions and deprecated client capabilities are explicit.
+	// issue every task lifecycle request, so modern task support is truthful by
+	// default. Legacy extensions and deprecated client capabilities are explicit.
 	caps := &mcp.ClientCapabilities{}
-	caps.AddExtension("io.modelcontextprotocol/tasks", nil)
+	if lifecycle == ModernLifecycle {
+		caps.AddExtension("io.modelcontextprotocol/tasks", nil)
+	}
 	if extra == nil {
 		return caps, nil
 	}
@@ -400,11 +451,13 @@ func clientCapabilities(extra map[string]any) (*mcp.ClientCapabilities, error) {
 	if err := json.Unmarshal(raw, caps); err != nil {
 		return nil, fmt.Errorf("client capabilities: %w", err)
 	}
-	if caps.Extensions == nil {
-		caps.Extensions = make(map[string]any)
-	}
-	if _, ok := caps.Extensions["io.modelcontextprotocol/tasks"]; !ok {
-		caps.AddExtension("io.modelcontextprotocol/tasks", nil)
+	if lifecycle == ModernLifecycle {
+		if caps.Extensions == nil {
+			caps.Extensions = make(map[string]any)
+		}
+		if _, ok := caps.Extensions["io.modelcontextprotocol/tasks"]; !ok {
+			caps.AddExtension("io.modelcontextprotocol/tasks", nil)
+		}
 	}
 	return caps, nil
 }
