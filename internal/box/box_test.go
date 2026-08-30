@@ -36,6 +36,9 @@ func TestMakeGrantsNothingUntilAdmit(t *testing.T) {
 	if len(admission) != 0 {
 		t.Fatalf("fresh admission is not empty: %q", admission)
 	}
+	if entries, err := os.ReadDir(filepath.Join(target, "actions")); err != nil || len(entries) != 0 {
+		t.Fatalf("fresh action connector directory = %v, %v", entries, err)
+	}
 
 	var listing bytes.Buffer
 	if err := List(&listing, target, "tools"); err != nil {
@@ -78,6 +81,26 @@ func TestMakeGrantsNothingUntilAdmit(t *testing.T) {
 		t.Fatalf("wrapper output = %s", out)
 	}
 
+	if err := Admit(target, "actions", []string{"echo"}, Config{MCP: fake}); err != nil {
+		t.Fatal(err)
+	}
+	action := filepath.Join(target, "actions", "echo")
+	described, err := exec.Command(action, "describe").Output()
+	if err != nil || !strings.Contains(string(described), `"input_schema":{"type":"object"}`) {
+		t.Fatalf("action descriptor: %s, %v", described, err)
+	}
+	cmd = exec.Command(action, "run")
+	cmd.Stdin = strings.NewReader(`{"effect":"exact"}`)
+	if out, err := cmd.Output(); err != nil || !strings.Contains(string(out), `"effect":"exact"`) {
+		t.Fatalf("action connector: %s, %v", out, err)
+	}
+	if err := Revoke(target, "actions", []string{"echo"}, Config{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(action); !os.IsNotExist(err) {
+		t.Fatalf("revoked action remains: %v", err)
+	}
+
 	if err := Revoke(target, "tools", []string{"echo"}, Config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +141,33 @@ func TestMakeGrantsNothingUntilAdmit(t *testing.T) {
 	templateRead := filepath.Join(target, "bin", "read-template")
 	if out, err := exec.Command(templateRead, "doc://guide/{chapter}", "doc://guide/intro").Output(); err != nil || !strings.Contains(string(out), `"contents"`) {
 		t.Fatalf("template reader: %s, %v", out, err)
+	}
+}
+
+func TestOlderBoxWithoutActionSurfaceStillShowsAndCanUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "mcp")
+	writeFakeMCP(t, fake, false)
+	target := filepath.Join(dir, "server.mcp")
+	endpoint := admit.Endpoint{Type: "stdio", Command: "/bin/echo"}
+	if err := Make(context.Background(), target, endpoint, Config{MCP: fake}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(target, "admit", "actions.tsv")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(target, "actions")); err != nil {
+		t.Fatal(err)
+	}
+	var shown bytes.Buffer
+	if err := Show(&shown, target); err != nil || !strings.Contains(shown.String(), "actions\t0 admitted") {
+		t.Fatalf("show old box: %q, %v", shown.String(), err)
+	}
+	if err := Admit(target, "actions", []string{"echo"}, Config{MCP: fake}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "actions", "echo")); err != nil {
+		t.Fatal(err)
 	}
 }
 

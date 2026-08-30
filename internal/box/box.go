@@ -86,7 +86,7 @@ func Make(ctx context.Context, target string, endpoint admit.Endpoint, cfg Confi
 	if err := writePrettyRaw(filepath.Join(stage, "discover.json"), discovery, 0o644); err != nil {
 		return err
 	}
-	for _, dir := range []string{"catalog", "admit", "tools", "prompts", "resources", "bin"} {
+	for _, dir := range []string{"catalog", "admit", "tools", "actions", "prompts", "resources", "bin"} {
 		if err := os.Mkdir(filepath.Join(stage, dir), 0o755); err != nil {
 			return err
 		}
@@ -121,6 +121,9 @@ func Make(ctx context.Context, target string, endpoint admit.Endpoint, cfg Confi
 		if err := os.WriteFile(filepath.Join(stage, "admit", spec.kind+".tsv"), nil, 0o644); err != nil {
 			return err
 		}
+	}
+	if err := os.WriteFile(filepath.Join(stage, "admit", "actions.tsv"), nil, 0o644); err != nil {
+		return err
 	}
 	if err := writeJSON(filepath.Join(stage, "runtime.json"), map[string]any{
 		"mcp": mcpPath,
@@ -159,6 +162,9 @@ func List(w io.Writer, dir, kind string) error {
 func Admit(dir, kind string, names []string, cfg Config) error {
 	if len(names) == 0 {
 		return fmt.Errorf("name at least one capability to admit")
+	}
+	if strings.TrimSuffix(kind, "s") == "action" {
+		return admitActions(dir, names, cfg)
 	}
 	spec, err := specFor(kind)
 	if err != nil {
@@ -212,6 +218,9 @@ func Admit(dir, kind string, names []string, cfg Config) error {
 }
 
 func Revoke(dir, kind string, names []string, cfg Config) error {
+	if strings.TrimSuffix(kind, "s") == "action" {
+		return revokeActions(dir, names)
+	}
 	spec, err := specFor(kind)
 	if err != nil {
 		return err
@@ -277,7 +286,70 @@ func Show(w io.Writer, dir string) error {
 		}
 		fmt.Fprintf(w, "%s\t%d discovered\t%d admitted\n", spec.kind, len(entries), len(admitted))
 	}
+	actions, err := readOptionalAdmissions(filepath.Join(dir, "admit", "actions.tsv"))
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "actions\t%d admitted\n", len(actions))
 	return nil
+}
+
+func admitActions(dir string, names []string, cfg Config) error {
+	spec, _ := specFor("tools")
+	endpoint, discovery, entries, err := loadCatalog(dir, spec)
+	if err != nil {
+		return err
+	}
+	byName := make(map[string]catalogEntry, len(entries))
+	for _, entry := range entries {
+		byName[entry.id] = entry
+	}
+	path := filepath.Join(dir, "admit", "actions.tsv")
+	admissions, err := readOptionalAdmissions(path)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "actions"), 0o755); err != nil {
+		return err
+	}
+	for _, name := range names {
+		entry, ok := byName[name]
+		if !ok {
+			return fmt.Errorf("tool %q is not in the discovered catalogue", name)
+		}
+		if !safeName.MatchString(name) {
+			return fmt.Errorf("tool name %q is not a safe action connector name", name)
+		}
+		if ref, ok := externalSchemaRef(entry.raw); ok {
+			return fmt.Errorf("tool %q contains unadmitted external schema reference %q", name, ref)
+		}
+		digest, err := admit.Digest(spec.kind, endpoint, discovery, entry.raw)
+		if err != nil {
+			return err
+		}
+		admissions[name] = digest
+	}
+	if err := writeAdmissionsAtomic(path, admissions); err != nil {
+		return err
+	}
+	return renderActions(dir, endpoint, byName, admissions, cfg)
+}
+
+func revokeActions(dir string, names []string) error {
+	path := filepath.Join(dir, "admit", "actions.tsv")
+	admissions, err := readOptionalAdmissions(path)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		if safeName.MatchString(name) {
+			if err := os.Remove(filepath.Join(dir, "actions", name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		delete(admissions, name)
+	}
+	return writeAdmissionsAtomic(path, admissions)
 }
 
 func Diff(ctx context.Context, oldDir, newDir string, stdout, stderr io.Writer) (int, error) {
@@ -451,6 +523,14 @@ func readAdmissions(path string) (map[string]string, error) {
 	return out, scanner.Err()
 }
 
+func readOptionalAdmissions(path string) (map[string]string, error) {
+	admissions, err := readAdmissions(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]string{}, nil
+	}
+	return admissions, err
+}
+
 func writeAdmissionsAtomic(path string, admissions map[string]string) error {
 	names := make([]string, 0, len(admissions))
 	for name := range admissions {
@@ -479,6 +559,43 @@ func renderTools(dir string, endpoint admit.Endpoint, entries map[string]catalog
 		}
 		body := renderTool(mcpPath, endpoint, name, digest, entry.description)
 		if err := writeAtomic(filepath.Join(dir, "tools", name), []byte(body), 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func renderActions(dir string, endpoint admit.Endpoint, entries map[string]catalogEntry, admissions map[string]string, cfg Config) error {
+	mcpPath, err := runtimeMCP(dir, cfg)
+	if err != nil {
+		return err
+	}
+	for name, digest := range admissions {
+		entry, ok := entries[name]
+		if !ok {
+			continue
+		}
+		var tool struct {
+			InputSchema json.RawMessage `json:"inputSchema"`
+		}
+		if err := json.Unmarshal(entry.raw, &tool); err != nil || len(tool.InputSchema) == 0 {
+			return fmt.Errorf("tool %q has no inputSchema", name)
+		}
+		description := oneLine(entry.description)
+		if description == "" {
+			description = "Invoke MCP tool " + name
+		}
+		descriptor, err := json.Marshal(struct {
+			Version     int             `json:"version"`
+			Name        string          `json:"name"`
+			Description string          `json:"description"`
+			InputSchema json.RawMessage `json:"input_schema"`
+		}{1, name, description, tool.InputSchema})
+		if err != nil {
+			return err
+		}
+		body := renderAction(mcpPath, endpoint, name, digest, descriptor)
+		if err := writeAtomic(filepath.Join(dir, "actions", name), []byte(body), 0o755); err != nil {
 			return err
 		}
 	}
@@ -599,6 +716,27 @@ func renderTool(mcpPath string, endpoint admit.Endpoint, name, digest, descripti
 	fmt.Fprintf(&body, "exec %s $mcp_headers tool -expect %s %s --", shellQuote(mcpPath), shellQuote(digest), shellQuote(name))
 	writeEndpointArgs(&body, endpoint)
 	fmt.Fprintln(&body)
+	return body.String()
+}
+
+func renderAction(mcpPath string, endpoint admit.Endpoint, name, digest string, descriptor []byte) string {
+	var body strings.Builder
+	fmt.Fprintln(&body, "#!/bin/sh")
+	fmt.Fprintf(&body, "# admitted effectful MCP tool %s descriptor %s\n", name, digest)
+	fmt.Fprintln(&body, "case ${1-} in")
+	fmt.Fprintln(&body, "  describe)")
+	fmt.Fprintln(&body, "    test \"$#\" -eq 1 || { echo 'usage: connector describe' >&2; exit 2; }")
+	fmt.Fprintf(&body, "    printf '%%s\\n' %s\n", shellQuote(string(descriptor)))
+	fmt.Fprintln(&body, "    ;;")
+	fmt.Fprintln(&body, "  run)")
+	fmt.Fprintln(&body, "    test \"$#\" -eq 1 || { echo 'usage: connector run' >&2; exit 2; }")
+	writeRuntimePrefix(&body, endpoint)
+	fmt.Fprintf(&body, "    exec %s $mcp_headers tool -expect %s %s --", shellQuote(mcpPath), shellQuote(digest), shellQuote(name))
+	writeEndpointArgs(&body, endpoint)
+	fmt.Fprintln(&body)
+	fmt.Fprintln(&body, "    ;;")
+	fmt.Fprintln(&body, "  *) echo 'usage: connector describe|run' >&2; exit 2 ;;")
+	fmt.Fprintln(&body, "esac")
 	return body.String()
 }
 

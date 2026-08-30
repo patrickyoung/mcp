@@ -17,6 +17,9 @@ sibling of Bench, Ply, Tend, and Agent; none of those programs know MCP exists.
 - `mcpbox` compiles discovery into a folder. Generation is staged and atomic;
   discovery grants nothing; admission binds a descriptor digest; an
   unadmitted or changed capability must not remain executable.
+- Effectful admission is explicit. `admit ... actions` generates connectors
+  for the standalone Action filter; it never trusts MCP annotations to bypass
+  operator policy or May.
 - Generated programs pin the endpoint, capability name, and reviewed digest.
   They accept exact JSON on stdin and do not contain credentials.
 - No daemon, endpoint registry, credential database, hidden cache, automatic

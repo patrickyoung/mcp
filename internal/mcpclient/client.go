@@ -359,7 +359,7 @@ func connect(parent context.Context, endpoint Endpoint, opts Options, listening 
 	if opts.Lifecycle == LegacyLifecycle {
 		clientName = "unix-mcp-legacy"
 	}
-	c := mcp.NewClient(&mcp.Implementation{Name: clientName, Version: "0.2.1"}, clientOpts)
+	c := mcp.NewClient(&mcp.Implementation{Name: clientName, Version: "0.3.0"}, clientOpts)
 	transport := rec.transport(base)
 	if opts.Lifecycle == LegacyLifecycle {
 		transport = forceLegacyTransport(transport)

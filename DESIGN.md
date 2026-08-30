@@ -11,6 +11,9 @@ session lifecycle; it is never selected by fallback from `mcp`.
 `mcpbox` compiles one server's discovery result into a folder whose executable
 entries are the exact capabilities an operator admitted.
 
+An action admission compiles an effectful tool into an Action-compatible
+connector; Action, not MCP, owns deterministic policy, May, and replay events.
+
 `mcpserve` publishes declared MCP capabilities while running each behavior as
 one ordinary Unix filter process.
 
@@ -54,10 +57,12 @@ server.mcp/
     templates.pages.jsonl
   admit/
     tools.tsv
+    actions.tsv
     prompts.tsv
     resources.tsv
     templates.tsv
   tools/
+  actions/
   prompts/
   resources/
   bin/
@@ -105,6 +110,9 @@ server identity to the existing digest model. Deprecated HTTP+SSE and legacy
 long-lived notification subscriptions are outside this one-request adapter.
 
 - Tools have generated, digest-checked executable wrappers.
+- Explicit action admissions have separate `describe|run` connectors. They
+  retain the same tool descriptor digest but do not make the tool directly
+  callable without Action's policy boundary.
 - Prompts have separate operator-invoked, digest-checked filters.
 - Exact resources use a generated allowlisting reader.
 - Resource templates have a whole-template admission. The reader verifies the

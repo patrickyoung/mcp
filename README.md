@@ -168,6 +168,22 @@ descriptor digest. Immediately before use, `mcp` re-lists that descriptor on
 the same connection and refuses changed or missing capabilities before
 sending the requested operation.
 
+For an effectful tool, admit it as an Action connector instead of making it a
+direct toolbox program:
+
+```sh
+mcpbox admit server.mcp actions publish_release
+printf '%s\n' '{"version":"1.4.2"}' |
+  ACTION_PATH=$PWD/server.mcp/actions \
+  action run -job release-142 publish_release
+```
+
+The generated connector implements `describe` and `run`, pins the same MCP
+descriptor digest, and rechecks it before the tool call. MCP annotations are
+preserved in that digest but never supply approval authority. Action owns
+policy, May, and sealed replay receipts. Do not also admit the same effectful
+tool under `tools/` unless direct invocation is intentionally authorized.
+
 `mcpbox` is provisioning only. Generated programs execute `mcp` directly and
 have no runtime dependency on `mcpbox`; Ply, Agent, Pack, and other consumers
 need only the admitted capability directory.

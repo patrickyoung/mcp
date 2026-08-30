@@ -13,7 +13,7 @@ import (
 	"github.com/patrickyoung/mcp/internal/mcpclient"
 )
 
-const version = "0.2.1"
+const version = "0.3.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -62,11 +62,15 @@ func run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 			return fail(stderr, err)
 		}
 		return 0
-	case "tools", "prompts", "resources", "templates":
+	case "tools", "actions", "prompts", "resources", "templates":
 		if len(argv) != 2 {
 			return fail(stderr, fmt.Errorf("%s: expected DIR", argv[0]))
 		}
-		if err := box.List(stdout, argv[1], argv[0]); err != nil {
+		kind := argv[0]
+		if kind == "actions" {
+			kind = "tools"
+		}
+		if err := box.List(stdout, argv[1], kind); err != nil {
 			return fail(stderr, err)
 		}
 		return 0
@@ -112,12 +116,13 @@ func usage(w io.Writer) {
   mcpbox make [-mcp PATH] [-headers FILE] DIR -- SERVER [ARG ...]
   mcpbox show DIR
   mcpbox diff OLD NEW
-  mcpbox tools|prompts|resources|templates DIR
+  mcpbox tools|actions|prompts|resources|templates DIR
   mcpbox admit DIR KIND NAME [...]
   mcpbox revoke DIR KIND NAME [...]
 
 make discovers into a new folder atomically and grants nothing. Listing a
-kind prints name, descriptor digest, and synopsis as TSV. admit is the only
-command that creates callable programs; changed descriptors stop at runtime
-before a capability request is sent.`)
+kind prints name, descriptor digest, and synopsis as TSV. admit DIR actions
+creates Action-compatible connectors for effectful tools; ordinary tool
+admission bypasses that action gate. Changed descriptors stop at runtime before
+a capability request is sent.`)
 }

@@ -12,7 +12,7 @@ func TestVersionAndLegacyUsage(t *testing.T) {
 	if code := run(context.Background(), []string{"version"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
 		t.Fatalf("version exit=%d stderr=%q", code, stderr.String())
 	}
-	if stdout.String() != "mcp-legacy 0.2.1\n" {
+	if stdout.String() != "mcp-legacy 0.3.0\n" {
 		t.Fatalf("version output = %q", stdout.String())
 	}
 	stdout.Reset()

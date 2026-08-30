@@ -23,6 +23,14 @@ OS confinement. Use Cage, a container, VM, separate OS identity, and explicit
 network policy when a worker or MCP server must not inherit ambient host
 authority.
 
+Effectful tools should be admitted under `actions/` and invoked through the
+standalone Action filter. The generated connector pins the discovered tool
+descriptor and rechecks it before the MCP request, but neither that digest nor
+MCP annotations grant approval. Action's operator policy and exact May request
+remain the authority boundary. Direct admission under `tools/` deliberately
+bypasses that gate and should be reserved for capabilities whose direct use is
+already authorized.
+
 Resource URIs remain data and are never treated as local filesystem paths.
 This release does not fetch icons, remote assets, or MCP App resources except
 through an explicit admitted MCP request.
